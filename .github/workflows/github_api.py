@@ -35,7 +35,7 @@ class GitHubAPI:
 
   def _make_request(
       self, verb: str, endpoint: str, **kwargs: dict[str, Any]
-  ) -> requests.Response:
+  ) -> dict[str, Any]:
     """Helper method to make a request and raise an HTTPError if one occurred.
 
     Arguments:
@@ -44,7 +44,7 @@ class GitHubAPI:
       **kwargs: The json that will be sent as the body of the request.
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError
@@ -57,7 +57,7 @@ class GitHubAPI:
     res.raise_for_status()
     return res.json()
 
-  def get_commit(self, repo: str, commit_id: str) -> requests.Response:
+  def get_commit(self, repo: str, commit_id: str) -> dict[str, Any]:
     """Gets a commit by it's SHA-1 hash.
 
     https://docs.github.com/en/rest/commits/commits?apiVersion=2022-11-28#get-a-
@@ -69,7 +69,7 @@ class GitHubAPI:
         `HEAD`.
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError
@@ -79,7 +79,7 @@ class GitHubAPI:
 
   def write_issue_comment(
       self, repo: str, issue_number: int, body: str
-  ) -> requests.Response:
+  ) -> dict[str, Any]:
     """Writes a comment on an issue (or PR).
 
     https://docs.github.com/en/rest/issues/comments?apiVersion=2022-11-
@@ -91,7 +91,7 @@ class GitHubAPI:
       body: the body of the comment
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError
@@ -101,7 +101,7 @@ class GitHubAPI:
 
   def set_issue_status(
       self, repo: str, issue_number: int, status: str
-  ) -> requests.Response:
+  ) -> dict[str, Any]:
     """Sets the status of an issue (or PR).
 
     https://docs.github.com/en/rest/issues/issues?apiVersion=2022-11-28#update-
@@ -113,7 +113,7 @@ class GitHubAPI:
       status: the status to set
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError
@@ -123,7 +123,7 @@ class GitHubAPI:
 
   def add_issue_labels(
       self, repo: str, issue_number: int, labels: list[str]
-  ) -> requests.Response:
+  ) -> dict[str, Any]:
     """Adds labels to an issue (or PR).
 
     https://docs.github.com/en/actions/managing-issues-and-pull-requests/adding-labels-to-issues
@@ -134,7 +134,7 @@ class GitHubAPI:
       labels: the labels to add to the issue
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError
@@ -142,7 +142,7 @@ class GitHubAPI:
     endpoint = f"repos/{repo}/issues/{issue_number}/labels"
     return self._make_request("POST", endpoint, labels=labels)
 
-  def get_user_orgs(self, username: str) -> requests.Response:
+  def get_user_orgs(self, username: str) -> dict[str, Any]:
     """Gets all public org memberships for a user.
 
     https://docs.github.com/en/rest/orgs/orgs?apiVersion=2022-11-28#list-organizations-for-a-user
@@ -151,7 +151,7 @@ class GitHubAPI:
       username: The user's GitHub username as a string.
 
     Returns:
-      a requests.Response object containing the response from the API.
+      The decoded JSON response as a Python dictionary.
 
     Raises:
       requests.exceptions.HTTPError

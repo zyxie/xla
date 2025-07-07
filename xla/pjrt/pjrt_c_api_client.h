@@ -315,7 +315,7 @@ class PjRtCApiClient : public PjRtClient {
   absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> CompileAndLoad(
       mlir::ModuleOp module, CompileOptions options) override;
 
-  // `PjRtCApiClient::LoadSerializedExecutable()` ignores `CompileOptions` arg
+  // `PjRtCApiClient::LoadSerializedExecutable()` ignores `LoadOptions` arg
   absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
   LoadSerializedExecutable(absl::string_view serialized,
                            std::optional<CompileOptions> options,
@@ -475,7 +475,7 @@ class PjRtCApiBuffer : public PjRtBuffer {
         "PJRT C API does not support ReleaseDeviceMemoryOwnership");
   }
 
-  bool IsDeleted() override;
+  bool IsDeleted() const override;
 
   absl::StatusOr<std::unique_ptr<PjRtBuffer>> CopyToMemorySpace(
       PjRtMemorySpace* dst_memory_space) override;
@@ -666,7 +666,7 @@ class PjRtCApiLoadedExecutable : public PjRtLoadedExecutable {
       std::optional<PjRtFuture<>>& returned_future, bool fill_future) override;
 
   void Delete() override;
-  bool IsDeleted() override;
+  bool IsDeleted() const override;
 
   absl::StatusOr<std::string> SerializeExecutable() const override {
     return executable_->SerializeExecutable();

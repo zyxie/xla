@@ -61,6 +61,7 @@ xla_cc_test(
     name = "sycl_platform_test",
     srcs = ["sycl_platform_test.cc"],
     fail_if_no_test_linked = False,  # NOLINT=If not building with SYCL, we don't have any tests linked.
+    fail_if_no_test_selected = False,  # NOLINT=If not building with SYCL, we don't have any tests linked.
     deps = [
         ":sycl_platform",
         "//xla/stream_executor:platform",
@@ -86,6 +87,10 @@ cc_library(
 
 cc_library(
     name = "stream_executor_sycl",
+    tags = [
+        "gpu",
+        "oneapi-only",
+    ],
     deps = [
         ":sycl_platform_id",
         ":sycl_rpath",
@@ -96,13 +101,38 @@ cc_library(
 )
 
 cc_library(
+    name = "sycl_status",
+    srcs = ["sycl_status.cc"],
+    hdrs = ["sycl_status.h"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "sycl_status_test",
+    srcs = ["sycl_status_test.cc"],
+    deps = [
+        ":sycl_status",
+        "//xla/tsl/platform:status_matchers",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "sycl_solver_context",
     srcs = ["sycl_solver_context.cc"],
     hdrs = ["sycl_solver_context.h"],
     tags = [
         "gpu",
         "manual",
-        "sycl-only",
+        "oneapi-only",
     ],
     deps = [
         ":sycl_platform_id",

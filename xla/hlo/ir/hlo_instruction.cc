@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/no_destructor.h"
 #include "absl/base/optimization.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -96,19 +97,6 @@ using absl::StrJoin;
 // Empty static object
 const HloInstruction::Rare* const HloInstruction::kEmptyRare =
     new HloInstruction::Rare;
-
-namespace {
-// Specialization for erasing from PtrVec<T>.
-template <typename T>
-absl::Status EraseElementFromVector(PtrVec<T>* container, T value) {
-  // absl::c_find returns a const_iterator which does not seem to work on
-  // gcc 4.8.4, and this breaks the ubuntu/xla_gpu build bot.
-  auto it = std::find(container->begin(), container->end(), value);
-  TF_RET_CHECK(it != container->end());
-  container->erase(it);
-  return absl::OkStatus();
-}
-}  // namespace
 
 HloInstruction::Users::~Users() = default;
 
@@ -246,7 +234,7 @@ const PtrVec<HloComputation*>& HloInstruction::called_computations() const {
     return rare()->called_computations;
   }
 
-  static PtrVec<HloComputation*>* empty = new PtrVec<HloComputation*>;
+  static const absl::NoDestructor<PtrVec<HloComputation*>> empty;
   return *empty;
 }
 
@@ -2970,12 +2958,11 @@ absl::Status HloInstruction::RemoveControlDependencyTo(
     HloInstruction* instruction) {
   TF_RET_CHECK(instruction->parent() == parent());
   if (has_rare()) {
-    TF_RETURN_IF_ERROR(EraseElementFromVector(
-        &mutable_rare()->control_successors, instruction));
+    EraseElementFromVector(&mutable_rare()->control_successors, instruction);
   }
   if (instruction->has_rare()) {
-    TF_RETURN_IF_ERROR(EraseElementFromVector(
-        &instruction->mutable_rare()->control_predecessors, this));
+    EraseElementFromVector(&instruction->mutable_rare()->control_predecessors,
+                           this);
   }
   return absl::OkStatus();
 }
@@ -2983,12 +2970,12 @@ absl::Status HloInstruction::RemoveControlDependencyTo(
 absl::Status HloInstruction::DropAllControlDeps() {
   if (has_rare()) {
     for (auto* ctrl_succ : rare()->control_successors) {
-      TF_RETURN_IF_ERROR(EraseElementFromVector(
-          &ctrl_succ->mutable_rare()->control_predecessors, this));
+      EraseElementFromVector(&ctrl_succ->mutable_rare()->control_predecessors,
+                             this);
     }
     for (auto* ctrl_pred : rare()->control_predecessors) {
-      TF_RETURN_IF_ERROR(EraseElementFromVector(
-          &ctrl_pred->mutable_rare()->control_successors, this));
+      EraseElementFromVector(&ctrl_pred->mutable_rare()->control_successors,
+                             this);
     }
     Rare* r = mutable_rare();
     r->control_successors.clear();
@@ -5287,17 +5274,18 @@ std::string ConvolutionDimensionNumbersToString(
 
 absl::StatusOr<RandomAlgorithm> StringToRandomAlgorithm(
     const std::string& name) {
-  static absl::flat_hash_map<std::string, RandomAlgorithm>* map = [] {
-    static auto* const map =
-        new absl::flat_hash_map<std::string, RandomAlgorithm>;
-    for (int i = 0; i < RandomAlgorithm_ARRAYSIZE; i++) {
-      if (RandomAlgorithm_IsValid(i)) {
-        auto value = static_cast<RandomAlgorithm>(i);
-        (*map)[RandomAlgorithmToString(value)] = value;
-      }
-    }
-    return map;
-  }();
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, RandomAlgorithm>>
+      map([] {
+        absl::flat_hash_map<std::string, RandomAlgorithm> map;
+        for (int i = 0; i < RandomAlgorithm_ARRAYSIZE; i++) {
+          if (RandomAlgorithm_IsValid(i)) {
+            auto value = static_cast<RandomAlgorithm>(i);
+            map[RandomAlgorithmToString(value)] = value;
+          }
+        }
+        return map;
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown algorithm");
@@ -5307,17 +5295,18 @@ absl::StatusOr<RandomAlgorithm> StringToRandomAlgorithm(
 
 absl::StatusOr<RandomDistribution> StringToRandomDistribution(
     const std::string& name) {
-  static absl::flat_hash_map<std::string, RandomDistribution>* map = [] {
-    static auto* const map =
-        new absl::flat_hash_map<std::string, RandomDistribution>;
-    for (int i = 0; i < RandomDistribution_ARRAYSIZE; i++) {
-      if (RandomDistribution_IsValid(i)) {
-        auto value = static_cast<RandomDistribution>(i);
-        (*map)[RandomDistributionToString(value)] = value;
-      }
-    }
-    return map;
-  }();
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, RandomDistribution>>
+      map([] {
+        absl::flat_hash_map<std::string, RandomDistribution> map;
+        for (int i = 0; i < RandomDistribution_ARRAYSIZE; i++) {
+          if (RandomDistribution_IsValid(i)) {
+            auto value = static_cast<RandomDistribution>(i);
+            map[RandomDistributionToString(value)] = value;
+          }
+        }
+        return map;
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown distribution");
@@ -5327,18 +5316,18 @@ absl::StatusOr<RandomDistribution> StringToRandomDistribution(
 
 absl::StatusOr<PrecisionConfig::Precision> StringToPrecision(
     const std::string& name) {
-  static absl::flat_hash_map<std::string, PrecisionConfig::Precision>* map =
-      [] {
-        static auto* const map =
-            new absl::flat_hash_map<std::string, PrecisionConfig::Precision>;
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, PrecisionConfig::Precision>>
+      map([] {
+        absl::flat_hash_map<std::string, PrecisionConfig::Precision> map;
         for (int i = 0; i < PrecisionConfig::Precision_ARRAYSIZE; i++) {
           if (PrecisionConfig::Precision_IsValid(i)) {
             auto value = static_cast<PrecisionConfig::Precision>(i);
-            (*map)[PrecisionToString(value)] = value;
+            map[PrecisionToString(value)] = value;
           }
         }
         return map;
-      }();
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown precision");
@@ -5348,17 +5337,18 @@ absl::StatusOr<PrecisionConfig::Precision> StringToPrecision(
 
 absl::StatusOr<ResultAccuracy::Mode> StringToResultAccuracy(
     absl::string_view name) {
-  static const absl::flat_hash_map<std::string, ResultAccuracy::Mode>* map =
-      [] {
-        auto* map = new absl::flat_hash_map<std::string, ResultAccuracy::Mode>;
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, ResultAccuracy::Mode>>
+      map([] {
+        absl::flat_hash_map<std::string, ResultAccuracy::Mode> map;
         for (int i = 0; i < ResultAccuracy::Mode_ARRAYSIZE; i++) {
           if (ResultAccuracy::Mode_IsValid(i)) {
             auto value = static_cast<ResultAccuracy::Mode>(i);
-            (*map)[ResultAccuracyToString(value)] = value;
+            map[ResultAccuracyToString(value)] = value;
           }
         }
         return map;
-      }();
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown accuracy mode");
@@ -5368,18 +5358,18 @@ absl::StatusOr<ResultAccuracy::Mode> StringToResultAccuracy(
 
 absl::StatusOr<PrecisionConfig::Algorithm> StringToAlgorithm(
     const std::string& name) {
-  static absl::flat_hash_map<std::string, PrecisionConfig::Algorithm>* map =
-      [] {
-        static auto* const map =
-            new absl::flat_hash_map<std::string, PrecisionConfig::Algorithm>;
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, PrecisionConfig::Algorithm>>
+      map([] {
+        absl::flat_hash_map<std::string, PrecisionConfig::Algorithm> map;
         for (int i = 0; i < PrecisionConfig::Algorithm_ARRAYSIZE; i++) {
           if (PrecisionConfig::Algorithm_IsValid(i)) {
             auto value = static_cast<PrecisionConfig::Algorithm>(i);
-            (*map)[AlgorithmToString(value)] = value;
+            map[AlgorithmToString(value)] = value;
           }
         }
         return map;
-      }();
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown algorithm");
@@ -5389,17 +5379,18 @@ absl::StatusOr<PrecisionConfig::Algorithm> StringToAlgorithm(
 
 absl::StatusOr<CustomCallSchedule> StringToCustomCallSchedule(
     absl::string_view name) {
-  static const absl::flat_hash_map<std::string, CustomCallSchedule>* map = [] {
-    static auto* const map =
-        new absl::flat_hash_map<std::string, CustomCallSchedule>;
-    for (int i = 0; i < CustomCallSchedule_ARRAYSIZE; i++) {
-      if (CustomCallSchedule_IsValid(i)) {
-        auto value = static_cast<CustomCallSchedule>(i);
-        (*map)[CustomCallScheduleToString(value)] = value;
-      }
-    }
-    return map;
-  }();
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, CustomCallSchedule>>
+      map([] {
+        absl::flat_hash_map<std::string, CustomCallSchedule> map;
+        for (int i = 0; i < CustomCallSchedule_ARRAYSIZE; i++) {
+          if (CustomCallSchedule_IsValid(i)) {
+            auto value = static_cast<CustomCallSchedule>(i);
+            map[CustomCallScheduleToString(value)] = value;
+          }
+        }
+        return map;
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown schedule");
@@ -5409,18 +5400,18 @@ absl::StatusOr<CustomCallSchedule> StringToCustomCallSchedule(
 
 absl::StatusOr<CustomCallApiVersion> StringToCustomCallApiVersion(
     absl::string_view name) {
-  static const absl::flat_hash_map<std::string, CustomCallApiVersion>* map =
-      [] {
-        static auto* const map =
-            new absl::flat_hash_map<std::string, CustomCallApiVersion>;
+  static const absl::NoDestructor<
+      absl::flat_hash_map<std::string, CustomCallApiVersion>>
+      map([] {
+        absl::flat_hash_map<std::string, CustomCallApiVersion> map;
         for (int i = 0; i < CustomCallApiVersion_ARRAYSIZE; i++) {
           if (CustomCallApiVersion_IsValid(i)) {
             auto value = static_cast<CustomCallApiVersion>(i);
-            (*map)[CustomCallApiVersionToString(value)] = value;
+            map[CustomCallApiVersionToString(value)] = value;
           }
         }
         return map;
-      }();
+      }());
   auto found = map->find(absl::AsciiStrToLower(name));
   if (found == map->end()) {
     return InvalidArgument("Unknown API version");

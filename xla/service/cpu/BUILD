@@ -425,6 +425,7 @@ cc_library(
         "//xla/backends/cpu/runtime:thunk",
         "//xla/backends/cpu/runtime:thunk_proto_cc",
         "//xla/backends/cpu/runtime:thunk_proto_serdes",
+        "//xla/hlo/analysis:alias_info",
         "//xla/hlo/ir:hlo",
         "//xla/service:buffer_assignment",
         "//xla/service:buffer_value",
@@ -695,6 +696,8 @@ cc_library(
     hdrs = ["elemental_math_emitter.h"],
     deps = [
         "//xla:xla_data_proto_cc",
+        "//xla/codegen/math:erf",
+        "//xla/codegen/math:intrinsic",
         "//xla/service/llvm_ir:math_ops",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -1980,6 +1983,8 @@ cc_library(
     hdrs = ["elemental_ir_emitter.h"],
     deps = [
         ":elemental_math_emitter",
+        "//xla/codegen/math:exp",
+        "//xla/codegen/math:intrinsic",
         "//xla/hlo/ir:hlo",
         "//xla/service:elemental_ir_emitter",
         "//xla/service/llvm_ir:llvm_util",

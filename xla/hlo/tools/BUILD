@@ -1,6 +1,7 @@
 # Tools and utilities that aid in XLA development and usage.
 
-load("//xla:py_strict.bzl", "py_strict_binary", "py_strict_library")
+load("@xla//third_party/rules_python/python:py_binary.bzl", "py_binary")
+load("@xla//third_party/rules_python/python:py_library.bzl", "py_library")
 load(
     "//xla:xla.default.bzl",
     "xla_cc_binary",
@@ -29,15 +30,13 @@ xla_cc_binary(
     deps = [
         "//xla/tsl/lib/io:buffered_inputstream",
         "//xla/tsl/lib/io:random_inputstream",
+        "//xla/tsl/platform:env",
         "//xla/tsl/util:command_line_flags",
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:platform_port",
-        "@tsl//tsl/platform:status",
     ],
 )
 
@@ -46,12 +45,11 @@ xla_cc_binary(
     srcs = ["show_literal.cc"],
     deps = [
         "//xla:literal",
-        "//xla:types",
         "//xla:xla_data_proto_cc",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:logging",
+        "//xla/tsl/platform:env",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@tsl//tsl/platform:platform_port",
-        "@tsl//tsl/platform:status",
     ],
 )
 
@@ -60,13 +58,11 @@ xla_cc_binary(
     srcs = ["convert_computation.cc"],
     deps = [
         "//xla/service:hlo_proto_cc",
+        "//xla/tsl/platform:env",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:logging",
+        "@com_google_protobuf//:protobuf",
         "@tsl//tsl/platform:platform_port",
-        "@tsl//tsl/platform:protobuf",
-        "@tsl//tsl/platform:status",
     ],
 )
 
@@ -75,14 +71,14 @@ xla_cc_binary(
     srcs = ["hlo_module_metadata_processor.cc"],
     deps = [
         "//xla/service:hlo_proto_cc",
+        "//xla/tsl/platform:env",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:logging",
+        "@com_google_protobuf//:protobuf",
         "@tsl//tsl/platform:platform_port",
-        "@tsl//tsl/platform:protobuf",
-        "@tsl//tsl/platform:status",
     ],
 )
 
@@ -107,12 +103,11 @@ xla_cc_binary(
     deps = [
         "//xla:util",
         "//xla/service:hlo_proto_cc",
+        "//xla/tsl/platform:env",
         "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status:statusor",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:platform_port",
-        "@tsl//tsl/platform:status",
     ],
 )
 
@@ -124,6 +119,7 @@ xla_cc_binary(
         "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/parser:hlo_parser",
+        "//xla/hlo/translate:register",
         "//xla/hlo/translate:stablehlo",
         "//xla/hlo/translate/hlo_to_mhlo:hlo_to_mlir_hlo",
         "//xla/mlir_hlo:mhlo_passes",
@@ -157,12 +153,14 @@ xla_cc_binary(
     ],
 )
 
-py_strict_library(
+py_library(
     name = "generate_hlo_test_checks_lib",
     srcs = ["generate_hlo_test_checks.py"],
+    strict_deps = True,
 )
 
-py_strict_binary(
+py_binary(
     name = "generate_hlo_test_checks",
     srcs = ["generate_hlo_test_checks.py"],
+    strict_deps = True,
 )

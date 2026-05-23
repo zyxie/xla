@@ -22,11 +22,13 @@ limitations under the License.
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/literal.h"
 #include "xla/service/compiler.h"
+#include "xla/tools/run_hlo_module.pb.h"
 #include "xla/tsl/platform/test_benchmark.h"
 
 namespace xla::cpu {
@@ -38,7 +40,6 @@ using StrToStrMapping =
 struct HloBenchmarkOptions {
   int32_t num_executions = 1;
   bool disable_parallel_task_assigner = false;
-  bool use_thunk_runtime = true;
   // If not null, AOT compilation will be used.
   std::unique_ptr<AotCompilationOptions> aot_options;
 };
@@ -69,6 +70,13 @@ absl::Status RunHloBenchmark(benchmark::State& state,
                              absl::Span<const Literal* const> args,
                              const HloBenchmarkOptions& benchmark_options = {});
 
+// Same as above, except that it runs the module exactly once and does not
+// have a benchmark::State parameter, which makes it suitable for unit tests.
+absl::Status RunHloBenchmarkOnce(
+    std::unique_ptr<HloModule> hlo_module,
+    absl::Span<const Literal* const> args,
+    const HloBenchmarkOptions& benchmark_options = {});
+
 // Benchmarks the given HLO's compilation time.
 //
 // Takes the same options as RunHloBenchmark, except no arguments since the
@@ -81,6 +89,18 @@ absl::Status CompileHloBenchmark(
 absl::Status CompileHloBenchmark(benchmark::State& state,
                                  std::unique_ptr<HloModule> module,
                                  const HloBenchmarkOptions& benchmark_options);
+
+// Loads an HLO module. If the user provides an HloSnapshot or a
+// HloUnoptimizedSnapshot the iteration literals will be loaded as well.
+absl::StatusOr<std::pair<std::unique_ptr<HloModule>,
+                         std::unique_ptr<RunHloModuleIterationLiterals>>>
+LoadHloModuleAndMaybeIterationLiterals(absl::string_view hlo_path);
+
+// Loads an HLO module. If the user provides an HloSnapshot or a
+// HloUnoptimizedSnapshot the iteration literals will be loaded as well.
+absl::StatusOr<std::pair<std::unique_ptr<HloModule>,
+                         std::unique_ptr<RunHloModuleIterationLiterals>>>
+LoadHloModuleAndMaybeIterationLiteralsFromString(absl::string_view hlo_data);
 
 }  // namespace xla::cpu
 

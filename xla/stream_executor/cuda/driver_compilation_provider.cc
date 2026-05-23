@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -27,24 +28,23 @@ limitations under the License.
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "third_party/gpus/cuda/include/cuda.h"
 #include "xla/stream_executor/activate_context.h"
 #include "xla/stream_executor/cuda/compilation_options.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
-#include "xla/stream_executor/cuda/cuda_platform_id.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/cuda/cuda_status.h"
 #include "xla/stream_executor/cuda/ptx_compiler_helpers.h"
-#include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/platform.h"
-#include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/errors.h"
 
 namespace stream_executor::cuda {
 absl::StatusOr<Assembly> DriverCompilationProvider::Compile(
@@ -66,11 +66,7 @@ absl::StatusOr<Assembly> DriverCompilationProvider::CompileAndLink(
     const CudaComputeCapability& cc,
     absl::Span<const RelocatableModuleOrPtx> inputs,
     const CompilationOptions& options) const {
-  TF_ASSIGN_OR_RETURN(Platform * platform,
-                      PlatformManager::PlatformWithId(kCudaPlatformId));
-  TF_ASSIGN_OR_RETURN(StreamExecutor * executor,
-                      platform->ExecutorForDevice(0));
-  std::unique_ptr<ActivateContext> context = executor->Activate();
+  std::unique_ptr<ActivateContext> context = stream_exec_->Activate();
 
   CUlinkState link_state;
   CUjit_option jit_options[] = {CU_JIT_TARGET,
@@ -86,11 +82,19 @@ absl::StatusOr<Assembly> DriverCompilationProvider::CompileAndLink(
 #if CUDA_VERSION >= 12000
   // Even though CUDA 11.8 has Hopper support, SM 9.0a and most Hopper features
   // (WGMMA, TMA, and more) are only supported in CUDA 12+.
-  if (cc.major == 9 && cc.minor == 0) {
+  if (cc.feature_extension ==
+      CudaComputeCapability::FeatureExtension::kAcceleratedFeatures) {
     target =
         static_cast<CUjit_target>(target + CU_COMPUTE_ACCELERATED_TARGET_BASE);
   }
 #endif
+
+  if (cc.feature_extension ==
+      CudaComputeCapability::FeatureExtension::kFamilyCompatibleFeatures) {
+    return absl::UnimplementedError(
+        "Compiling forward compatible kernels is not implemented yet.");
+  }
+
   constexpr size_t kErrorLogBufferSize = 512 * 1024;  // 4 KiB
   std::string error_log_buffer(kErrorLogBufferSize, '\0');
 
@@ -131,23 +135,31 @@ absl::StatusOr<Assembly> DriverCompilationProvider::CompileAndLink(
   static_assert(sizeof(jit_options) / sizeof(jit_options[0]) ==
                 sizeof(jit_option_values) / sizeof(jit_option_values[0]));
 
-  TF_RETURN_IF_ERROR(cuda::ToStatus(
+  RETURN_IF_ERROR(cuda::ToStatus(
       cuLinkCreate(sizeof(jit_options) / sizeof(jit_options[0]), jit_options,
                    jit_option_values, &link_state)));
+  absl::Cleanup link_state_cleaner = [&link_state] {
+    CHECK_EQ(cuLinkDestroy(link_state), CUDA_SUCCESS);
+  };
 
   // We have to make a copy here because we need a null-terminated string.
   for (const auto& input : inputs) {
     if (std::holds_alternative<RelocatableModule>(input)) {
       const RelocatableModule& module = std::get<RelocatableModule>(input);
-      TF_RETURN_IF_ERROR(cuda::ToStatus(cuLinkAddData(
+      RETURN_IF_ERROR(cuda::ToStatus(cuLinkAddData(
           link_state, CU_JIT_INPUT_CUBIN,
           absl::bit_cast<void*>(module.cubin.data()), module.cubin.size(),
           /*name=*/"", 0, nullptr, nullptr)));
     } else {
       const std::string& ptx = std::get<Ptx>(input).ptx;
-      TF_RETURN_IF_ERROR(cuda::ToStatus(cuLinkAddData(
+      CUresult result = cuLinkAddData(
           link_state, CU_JIT_INPUT_PTX, absl::bit_cast<void*>(ptx.data()),
-          ptx.size() + 1, /*name=*/"", 0, nullptr, nullptr)));
+          ptx.size() + 1, /*name=*/"", 0, nullptr, nullptr);
+      if (result != CUDA_SUCCESS) {
+        CHECK(error_log_buffer_size() <= kErrorLogBufferSize);
+        error_log_buffer.resize(error_log_buffer_size());
+        RETURN_IF_ERROR(cuda::ToStatus(result, error_log_buffer));
+      }
     }
   }
 
@@ -155,34 +167,48 @@ absl::StatusOr<Assembly> DriverCompilationProvider::CompileAndLink(
   size_t cubin_size;
   CUresult result = cuLinkComplete(link_state, &cubin_out, &cubin_size);
 
-  absl::Cleanup link_state_cleaner = [&link_state] {
-    CHECK_EQ(cuLinkDestroy(link_state), CUDA_SUCCESS);
-  };
-
   CHECK(error_log_buffer_size() <= kErrorLogBufferSize);
   error_log_buffer.resize(error_log_buffer_size());
 
   CHECK(info_log_buffer_size() <= kInfoLogBufferSize);
   info_log_buffer.resize(info_log_buffer_size());
 
-  absl::string_view extension = ShouldUsePtxExtension(cc) ? "a" : "";
-  std::string architecture = absl::StrCat("sm_", cc.major, cc.minor, extension);
+  std::string architecture =
+      cc.GetPtxAsTargetName(CudaComputeCapability::CompileMode::kSass);
 
+  // Return status can be CUDA_SUCCESS with error in the log.
+  VLOG(3) << "Driver compilation error log output: " << error_log_buffer;
+  RETURN_IF_ERROR(CreateErrorFromPTXASLog(error_log_buffer, architecture,
+                                          options.cancel_if_reg_spill));
   if (result != CUDA_SUCCESS) {
-    VLOG(3) << "Driver compilation error log output: " << error_log_buffer;
-    TF_RETURN_IF_ERROR(CreateErrorFromPTXASLog(error_log_buffer, architecture,
-                                               options.cancel_if_reg_spill));
-
     return cuda::ToStatus(result, error_log_buffer);
   }
 
   VLOG(3) << "Driver compilation info log output: " << info_log_buffer;
-  TF_RETURN_IF_ERROR(CreateErrorFromPTXASLog(info_log_buffer, architecture,
-                                             options.cancel_if_reg_spill));
+  RETURN_IF_ERROR(CreateErrorFromPTXASLog(info_log_buffer, architecture,
+                                          options.cancel_if_reg_spill));
 
   std::vector<uint8_t> cubin(static_cast<uint8_t*>(cubin_out),
                              static_cast<uint8_t*>(cubin_out) + cubin_size);
-  return Assembly{std::move(cubin)};
+
+  std::optional<std::string> maybe_compilation_log;
+  if (options.dump_compilation_log) {
+    maybe_compilation_log =
+        absl::StrCat(error_log_buffer, "\n", error_log_buffer);
+  }
+  return Assembly{std::move(cubin), std::move(maybe_compilation_log)};
+}
+
+absl::StatusOr<int> DriverCompilationProvider::GetLatestPtxIsaVersion() const {
+  absl::StatusOr<Assembly> failed_compilation =
+      Compile(CudaComputeCapability::Hopper(), ".version 99.9\n", {});
+
+  if (failed_compilation.ok()) {
+    return absl::InternalError(
+        "compilation succeeded where it was expected to fail");
+  }
+  return GetLatestPtxIsaVersionFromUnsupportedVersionErrorLog(
+      failed_compilation.status().message());
 }
 
 }  // namespace stream_executor::cuda

@@ -17,18 +17,20 @@ limitations under the License.
 #define XLA_BACKENDS_AUTOTUNER_CODEGEN_BACKEND_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "google/protobuf/any.pb.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/backends/autotuner/backends.pb.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/executable.h"
-#include "tsl/platform/protobuf.h"
 
 namespace xla {
 
-using BackendConfig = tsl::protobuf::Message;
+using BackendConfig = google::protobuf::Any;
 
 // Interface for a codegen backend which can compile HLO instructions with
 // different configurations. This can be used to get the supported configs, and
@@ -38,6 +40,10 @@ class CodegenBackend {
   virtual ~CodegenBackend() = default;
 
   virtual absl::string_view name() const = 0;
+
+  virtual autotuner::Backend backend() const = 0;
+
+  virtual std::string version() const = 0;
 
   // Returns all supported configs for the given HLO instruction.
   virtual absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -55,8 +61,14 @@ class CodegenBackend {
       const HloInstruction& instr, const BackendConfig& config) = 0;
 
   // Apply config to the given HLO instruction.
+  // This can rarely lead to the instruction being replaced by new ones in the
+  // parent computation. Please check the documentation of the specific backend
+  // to understand if this is the case.
   virtual absl::Status ApplyConfig(HloInstruction& instr,
                                    const BackendConfig& config) = 0;
+
+  // Returns true if the backend can produce numerically wrong results.
+  virtual bool CanProduceWrongResults() const = 0;
 };
 
 }  // namespace xla

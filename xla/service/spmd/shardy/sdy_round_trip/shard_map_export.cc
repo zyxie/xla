@@ -51,7 +51,6 @@ namespace sdy {
 
 namespace {
 
-using ::mlir::MLIRContext;
 using ::mlir::ModuleOp;
 using ::mlir::StringRef;
 using ::mlir::func::CallOp;
@@ -66,13 +65,15 @@ class SdyRoundTripShardMapExportPass
  public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SdyRoundTripShardMapExportPass)
 
+  SdyRoundTripShardMapExportPass(bool enableHloShardingV3)
+      : enableHloShardingV3(enableHloShardingV3) {}
+
   void runOnOperation() final {
     ModuleOp moduleOp = getOperation();
-    MLIRContext* context = moduleOp.getContext();
     mlir::SymbolTableCollection symbolTableCollection;
     mlir::SymbolTable& symbolTable =
         symbolTableCollection.getSymbolTable(moduleOp);
-    auto rewriter = mlir::IRRewriter(context);
+    auto rewriter = mlir::IRRewriter(moduleOp.getContext());
     moduleOp->walk([&](sdy::ManualComputationOp manualComputation) {
       rewriter.setInsertionPointToEnd(&moduleOp.getRegion().front());
       mlir::Location loc = manualComputation.getLoc();
@@ -81,45 +82,52 @@ class SdyRoundTripShardMapExportPass
           manualCompBody.getArgumentTypes();
       mlir::TypeRange localResultTypes =
           sdy::getBodyTerminatorOpOperandTypes(manualComputation);
-      auto funcOp = rewriter.create<FuncOp>(
-          loc, kManualComputationBodyFuncName,
+      auto funcOp = FuncOp::create(
+          rewriter, loc, kManualComputationFuncName,
           rewriter.getFunctionType(manualCompBodyArgTypes, localResultTypes));
       mlir::StringAttr funcName = symbolTable.insert(funcOp);
 
       rewriter.setInsertionPoint(manualComputation);
-      stablehlo::CustomCallOp globalToLocalShape;
       mlir::ValueRange operands = manualComputation->getOperands();
       if (!operands.empty()) {
-        globalToLocalShape = rewriter.create<stablehlo::CustomCallOp>(
-            loc, manualCompBodyArgTypes, operands);
+        auto globalToLocalShape = stablehlo::CustomCallOp::create(
+            rewriter, loc, manualCompBodyArgTypes, operands);
         globalToLocalShape.setCallTargetName(kGlobalToLocalShapeCallTargetName);
         // We mark `xla.sdy.GlobalToLocalShape` as side-effecting to avoid
         // CSE deduping it with another taking the same operands, as it would
         // ignore the frontend attributes that could be different.
         globalToLocalShape.setHasSideEffect(true);
-        setFrontendAttribute(globalToLocalShape, kInShardings,
-                             manualComputation.getInShardings());
+        sdy::TensorShardingPerValueAttr inShardings =
+            manualComputation.getInShardings();
+        if (enableHloShardingV3) {
+          inShardings = sdy::inlineMesh(symbolTable, inShardings);
+        }
+        setFrontendAttribute(globalToLocalShape, kInShardings, inShardings);
         setFrontendAttribute(globalToLocalShape, kManualAxes,
                              manualComputation.getManualAxesAttr());
         operands = globalToLocalShape->getResults();
       }
 
       auto callOp =
-          rewriter.create<CallOp>(loc, localResultTypes, funcName, operands);
+          CallOp::create(rewriter, loc, localResultTypes, funcName, operands);
+      setFrontendAttribute(callOp, kXlaInlineableAttr,
+                           rewriter.getBoolAttr(false));
 
       mlir::ResultRange results = manualComputation->getResults();
       if (!results.empty()) {
-        auto localToGlobalShape = rewriter.create<stablehlo::CustomCallOp>(
-            loc, manualComputation.getResultTypes(), callOp->getResults());
-        // We don't mark `xla.sdy.LocalToGlobalShape` as side-effecting, so if
-        // any of its results has a dimension of size 0 (i.e. 0 num-elements),
-        // it will be replaced with a constant of the same shape.
+        auto localToGlobalShape = stablehlo::CustomCallOp::create(
+            rewriter, loc, manualComputation.getResultTypes(),
+            callOp->getResults());
         localToGlobalShape.setCallTargetName(kLocalToGlobalShapeCallTargetName);
         // We mark `xla.sdy.LocalToGlobalShape` as side-effecting to avoid
         // CSE removing it if it has no users.
         localToGlobalShape.setHasSideEffect(true);
-        setFrontendAttribute(localToGlobalShape, kOutShardings,
-                             manualComputation.getOutShardings());
+        sdy::TensorShardingPerValueAttr outShardings =
+            manualComputation.getOutShardings();
+        if (enableHloShardingV3) {
+          outShardings = sdy::inlineMesh(symbolTable, outShardings);
+        }
+        setFrontendAttribute(localToGlobalShape, kOutShardings, outShardings);
         setFrontendAttribute(localToGlobalShape, kManualAxes,
                              manualComputation.getManualAxesAttr());
         results = localToGlobalShape->getResults();
@@ -135,24 +143,30 @@ class SdyRoundTripShardMapExportPass
   }
 
   StringRef getDescription() const override {
-    return "Converts the body of a ManualComputationOp to a separate function "
-           "with a CallOp and a pair of CustomCallOps that change the shape of "
-           "the arguments/results. The CallOp saves the in/out shardings and "
-           "manual axes as frontend attrs.";
+    return "Converts a `ManualComputationOp` to the following."
+           "1. A separate function for the body of the `ManualComputationOp`."
+           "2. A `CallOp` calling the function in #1, marked as not inlinable."
+           "3. A pair of `CustomCallOp`s that change the shape of the "
+           "   arguments/results. They save the in/out shardings and manual "
+           "   axes as frontend attrs.";
   }
   void getDependentDialects(mlir::DialectRegistry& registry) const final {
     registry.insert<stablehlo::StablehloDialect>();
   }
+
+ private:
+  bool enableHloShardingV3 = false;
 };
 
 }  // namespace
 
 void registerSdyRoundTripShardMapExportPass() {
-  mlir::registerPass(createSdyRoundTripShardMapExportPass);
+  mlir::registerPass([]() { return createSdyRoundTripShardMapExportPass(); });
 }
 
-std::unique_ptr<mlir::Pass> createSdyRoundTripShardMapExportPass() {
-  return std::make_unique<SdyRoundTripShardMapExportPass>();
+std::unique_ptr<mlir::Pass> createSdyRoundTripShardMapExportPass(
+    bool enableHloShardingV3) {
+  return std::make_unique<SdyRoundTripShardMapExportPass>(enableHloShardingV3);
 }
 
 }  // namespace sdy

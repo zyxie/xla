@@ -19,6 +19,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -95,7 +96,7 @@ class FlattenCallGraphTest : public HloHardwareIndependentTestBase {
 
   absl::StatusOr<bool> RunFlattenCallGraph(HloModule* module) {
     FlattenCallGraph flatten;
-    TF_ASSIGN_OR_RETURN(bool result, flatten.Run(module));
+    ASSIGN_OR_RETURN(bool result, flatten.Run(module));
     return result;
   }
 
@@ -497,6 +498,107 @@ HloModule NoChange
   TF_ASSERT_OK_AND_ASSIGN(bool result, RunFlattenCallGraph(module.get()));
   ASSERT_EQ(module->computation_count(), 1);
   EXPECT_FALSE(result);
+}
+
+TEST_F(FlattenCallGraphTest, SkipCloningTest) {
+  std::string hlo_string = R"(
+HloModule SkipCloning
+
+%while_body (param: f32[]) -> f32[] {
+  %param = f32[] parameter(0)
+  ROOT %neg = f32[] negate(%param)
+}
+
+%while_cond (param: f32[]) -> pred[] {
+  %param = f32[] parameter(0)
+  %zero = f32[] constant(0.0)
+  ROOT %cmp = pred[] compare(%param, %zero), direction=GT
+}
+
+%a_comp (param: f32[]) -> f32[] {
+  %param = f32[] parameter(0)
+  ROOT %while = f32[] while(%param), condition=%while_cond, body=%while_body
+}
+
+%b_comp (param: f32[]) -> f32[] {
+  %param = f32[] parameter(0)
+  ROOT %while = f32[] while(%param), condition=%while_cond, body=%while_body
+}
+
+ENTRY %main (param: f32[]) -> (f32[], f32[], f32[]) {
+  %param = f32[] parameter(0)
+  %a.0 = f32[] call(%param), to_apply=%a_comp
+  %a.1 = f32[] call(%param), to_apply=%a_comp
+  %b = f32[] call(%param), to_apply=%b_comp
+  ROOT %tuple = (f32[], f32[], f32[]) tuple(%a.0, %a.1, %b)
+}
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  // Configure FlattenCallGraph to skip cloning if all callers are kCall.
+  FlattenCallGraph flatten([](const HloComputation& computation) {
+    std::unique_ptr<CallGraph> call_graph =
+        CallGraph::Build(computation.parent());
+    const CallGraphNode& node = call_graph->GetNode(&computation);
+    for (const CallSite& call_site : node.caller_callsites()) {
+      if (call_site.instruction()->opcode() != HloOpcode::kCall) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  TF_ASSERT_OK_AND_ASSIGN(bool result, flatten.Run(module.get()));
+  EXPECT_TRUE(result);
+
+  HloComputation* a_computation = FindComputation(module.get(), "a_comp");
+  HloComputation* while_body_computation =
+      FindComputation(module.get(), "while_body");
+
+  std::unique_ptr<CallGraph> call_graph = CallGraph::Build(module.get());
+  EXPECT_EQ(2, call_graph->GetNode(a_computation).caller_callsites().size());
+  EXPECT_EQ(
+      1, call_graph->GetNode(while_body_computation).caller_callsites().size());
+}
+
+TEST_F(FlattenCallGraphTest, PreserveScheduleTest) {
+  std::string hlo_string = R"(
+HloModule PreserveScheduleTest, is_scheduled=true
+
+%called_computation (param_0: f32[4096], param_1: f32[4096]) -> f32[4096] {
+  %param_0 = f32[4096] parameter(0)
+  %param_1 = f32[4096] parameter(1)
+  ROOT %result.1 = f32[4096] add(f32[4096] %param_0, f32[4096] %param_1)
+}
+
+ENTRY %main (a: f32[4096], b: f32[4096]) -> f32[4096] {
+  %a = f32[4096] parameter(0)
+  %b = f32[4096] parameter(1)
+  %call.0 = f32[4096] call(%a, %b), to_apply=%called_computation
+  %call.1 = f32[4096] call(%call.0, %b), to_apply=%called_computation
+  ROOT %add_1 = f32[4096] add(%a, %call.1)
+}
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(auto module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+
+  TF_ASSERT_OK_AND_ASSIGN(bool result, RunFlattenCallGraph(module.get()));
+  EXPECT_TRUE(result);
+
+  // We expect the entry computation and two called_computation computations.
+  EXPECT_EQ(3, module->computation_count());
+  HloComputation* called_computation_0 =
+      FindInstruction(module.get(), "call.0")->to_apply();
+  HloComputation* called_computation_1 =
+      FindInstruction(module.get(), "call.1")->to_apply();
+
+  EXPECT_TRUE(module->has_schedule());
+  const auto& schedule = module->schedule();
+
+  EXPECT_TRUE(schedule.is_computation_scheduled(called_computation_0));
+  EXPECT_TRUE(schedule.is_computation_scheduled(called_computation_1));
 }
 
 }  // namespace

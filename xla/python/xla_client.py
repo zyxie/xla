@@ -112,22 +112,32 @@ class ResultAccuracy:
 class OpMetadata:
   """Python representation of a xla.OpMetadata protobuf."""
 
-  __slots__ = ('op_type', 'op_name', 'source_file', 'source_line')
+  __slots__ = ('op_type', 'op_name', 'source_file', 'source_line',
+               'source_end_line', 'source_column', 'source_end_column')
 
-  def __init__(self, op_type='', op_name='', source_file='', source_line=0):
+  def __init__(self, op_type='', op_name='', source_file='', source_line=0,
+               source_end_line=0, source_column=0, source_end_column=0):
     self.op_type = op_type
     self.op_name = op_name
     self.source_file = source_file
     self.source_line = source_line
+    self.source_end_line = source_end_line
+    self.source_column = source_column
+    self.source_end_column = source_end_column
 
 
 def current_source_info_metadata(op_type=None, op_name=None, skip_frames=1):
   """Helper for use in source mapping that returns an OpMetadata object."""
-  full_filename, lineno = inspect.stack()[skip_frames][1:3]
-  filename = os.path.basename(full_filename)
-  return OpMetadata(
-      op_type=op_type, op_name=op_name, source_file=filename, source_line=lineno
-  )
+  frame = inspect.stack()[skip_frames]
+  filename = os.path.basename(frame.filename)
+  if hasattr(frame, 'positions'):
+    lineno, end_lineno, column, end_column = frame.positions
+    return OpMetadata(op_type=op_type, op_name=op_name, source_file=filename,
+                      source_line=lineno, source_end_line=end_lineno,
+                      source_column=column, source_end_column=end_column)
+  else:
+    return OpMetadata(op_type=op_type, op_name=op_name, source_file=filename,
+                      source_line=frame.lineno)
 
 
 def shape_from_pyval(pyval, layout: Sequence[int] | None = None):
@@ -437,3 +447,51 @@ def make_replica_groups(replica_groups):
         _make_replica_group_proto(group) for group in replica_groups
     ]
   return replica_groups_protos
+
+
+def get_backend_config_string(instruction_proto, module_proto=None) -> str:
+  """Extracts the backend_config string from an HloInstructionProto.
+
+  If the payload is stored externally, module_proto must be provided to look up
+  the string using the stored ID.
+
+  Args:
+    instruction_proto: An HloInstructionProto.
+    module_proto: An optional HloModuleProto.
+
+  Returns:
+    The backend config string.
+  """
+  if instruction_proto.HasField('backend_config_payload'):
+    payload = instruction_proto.backend_config_payload
+    if payload.HasField('id'):
+      if module_proto is not None and 0 <= payload.id < len(
+          module_proto.payloads
+      ):
+        return (
+            module_proto.payloads[payload.id].decode('utf-8')
+            if isinstance(module_proto.payloads[payload.id], bytes)
+            else module_proto.payloads[payload.id]
+        )
+      raise ValueError(
+          f'Payload requested ID {payload.id} but payloads array has size'
+          f' {len(module_proto.payloads) if module_proto else 0}'
+      )
+    return (
+        payload.value.decode('utf-8')
+        if isinstance(payload.value, bytes)
+        else payload.value
+    )
+  return (
+      instruction_proto.backend_config.decode('utf-8')
+      if isinstance(instruction_proto.backend_config, bytes)
+      else instruction_proto.backend_config
+  )
+
+
+# Expose hlo submodule.
+if hasattr(_xla, 'hlo_module_from_text'):
+  hlo = _xla
+else:
+  from . import _hlo as hlo  # pylint: disable=g-import-not-at-top
+

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <functional>
+#include <numeric>
 #include <set>
 #include <string>
 #include <utility>
@@ -30,6 +31,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -119,7 +121,6 @@ absl::StatusOr<HloInstruction*> TryMergeSameOperand(HloInstruction* a,
     return nullptr;
   }
 
-
   VLOG(2) << "Merging dots sharing an operand:\n"
           << "\t" << a->ToString() << "\n"
           << "\t" << b->ToString();
@@ -181,37 +182,9 @@ absl::StatusOr<HloInstruction*> TryMergeSameOperand(HloInstruction* a,
     ++outer_dim;
   }
 
-  HloDotInstruction* dot_a = Cast<HloDotInstruction>(a);
-  std::vector<SparsityDescriptor> sparsity(dot_a->sparsity().begin(),
-                                           dot_a->sparsity().end());
-  std::vector<HloInstruction*> sparse_meta(sparsity.size());
-  for (int i = 0; i < sparsity.size(); ++i) {
-    HloInstruction* meta = a->mutable_operand(HloDotInstruction::kOperands + i);
-    HloInstruction* other_meta =
-        b->mutable_operand(HloDotInstruction::kOperands + i);
-    if (sparsity[i].index() == (lhs_same ? 1 : 0)) {
-      TF_ASSIGN_OR_RETURN(
-          Shape meta_concat_shape,
-          ShapeInference::InferConcatOpShape(
-              {&meta->shape(), &other_meta->shape()}, outer_dim));
-      meta = meta->AddInstruction(HloInstruction::CreateConcatenate(
-          meta_concat_shape, {meta, other_meta}, outer_dim));
-    } else {
-      if (other_meta != meta) {
-        VLOG(3)
-            << "Can't merge dots because the sparsity metadata is different:\n"
-            << "\t" << a->ToString() << "\n"
-            << "\t" << b->ToString();
-        return nullptr;
-      }
-    }
-    sparse_meta[i] = meta;
-  }
-
-  TF_ASSIGN_OR_RETURN(
-      Shape concat_shape,
-      ShapeInference::InferConcatOpShape(
-          {&diff_op_a->shape(), &diff_op_b->shape()}, outer_dim));
+  ASSIGN_OR_RETURN(Shape concat_shape,
+                   ShapeInference::InferConcatOpShape(
+                       {&diff_op_a->shape(), &diff_op_b->shape()}, outer_dim));
   *concat_shape.mutable_layout() = diff_op_a->shape().layout();
   HloInstruction* concat_op =
       diff_op_a->AddInstruction(HloInstruction::CreateConcatenate(
@@ -219,15 +192,13 @@ absl::StatusOr<HloInstruction*> TryMergeSameOperand(HloInstruction* a,
 
   HloInstruction* dot_lhs = lhs_same ? shared_op : concat_op;
   HloInstruction* dot_rhs = lhs_same ? concat_op : shared_op;
-  TF_ASSIGN_OR_RETURN(
-      Shape new_dot_shape,
-      ShapeInference::InferDotOpShape(
-          dot_lhs->shape(), dot_rhs->shape(), dnums,
-          /*preferred_element_type=*/a->shape().element_type(), sparsity));
+  ASSIGN_OR_RETURN(Shape new_dot_shape,
+                   ShapeInference::InferDotOpShape(
+                       dot_lhs->shape(), dot_rhs->shape(), dnums,
+                       /*preferred_element_type=*/a->shape().element_type()));
   *new_dot_shape.mutable_layout() = a->shape().layout();
-  HloInstruction* new_dot = a->AddInstruction(
-      HloInstruction::CreateDot(new_dot_shape, dot_lhs, dot_rhs, dnums,
-                                a->precision_config(), sparsity, sparse_meta));
+  HloInstruction* new_dot = a->AddInstruction(HloInstruction::CreateDot(
+      new_dot_shape, dot_lhs, dot_rhs, dnums, a->precision_config()));
 
   // We can't keep both. But one is better then none.
   if (!a->metadata().op_name().empty()) {
@@ -249,13 +220,13 @@ absl::StatusOr<HloInstruction*> TryMergeSameOperand(HloInstruction* a,
   // must live until the end of the pass.
   HloInstruction* new_a = a->AddInstruction(HloInstruction::CreateSlice(
       a->shape(), new_dot, start_indices, limit_indices, strides));
-  TF_RETURN_IF_ERROR(a->ReplaceAllUsesWith(new_a));
+  RETURN_IF_ERROR(a->ReplaceAllUsesWith(new_a));
 
   start_indices[slice_dim] = limit_indices[slice_dim];
   limit_indices[slice_dim] = new_dot_shape.dimensions(slice_dim);
   HloInstruction* new_b = b->AddInstruction(HloInstruction::CreateSlice(
       b->shape(), new_dot, start_indices, limit_indices, strides));
-  TF_RETURN_IF_ERROR(b->ReplaceAllUsesWith(new_b));
+  RETURN_IF_ERROR(b->ReplaceAllUsesWith(new_b));
 
   return new_dot;
 }
@@ -298,14 +269,6 @@ bool EqualTransposed(HloInstruction* lhs, HloInstruction* rhs) {
 
 absl::StatusOr<HloInstruction*> TryMergeLHSWithRHSOperand(HloInstruction* a,
                                                           HloInstruction* b) {
-  if (!Cast<HloDotInstruction>(a)->sparsity().empty() ||
-      !Cast<HloDotInstruction>(b)->sparsity().empty()) {
-    VLOG(3) << "Merging sparse dots is not supported:\n"
-            << "\t" << a->ToString() << "\n"
-            << "\t" << b->ToString();
-    return nullptr;
-  }
-
   const DotDimensionNumbers& dnums_a = a->dot_dimension_numbers();
   const DotDimensionNumbers& dnums_b = b->dot_dimension_numbers();
   // TODO(tjoerg): Add support for batch dimensions.
@@ -377,18 +340,17 @@ absl::StatusOr<HloInstruction*> TryMergeLHSWithRHSOperand(HloInstruction* a,
   HloInstruction* b_lhs_transposed =
       b_lhs->AddInstruction(HloInstruction::CreateTranspose(
           ShapeUtil::PermuteDimensions({1, 0}, b_lhs->shape()), b_lhs, {1, 0}));
-  TF_ASSIGN_OR_RETURN(Shape concat_shape,
-                      ShapeInference::InferConcatOpShape(
-                          {&a_rhs->shape(), &b_lhs_transposed->shape()}, 1));
+  ASSIGN_OR_RETURN(Shape concat_shape,
+                   ShapeInference::InferConcatOpShape(
+                       {&a_rhs->shape(), &b_lhs_transposed->shape()}, 1));
   HloInstruction* new_rhs =
       a_rhs->AddInstruction(HloInstruction::CreateConcatenate(
           concat_shape, {a_rhs, b_lhs_transposed}, 1));
-  TF_ASSIGN_OR_RETURN(
-      Shape new_dot_shape,
-      ShapeInference::InferDotOpShape(
-          a_lhs->shape(),  // The new LHS is the LHS of a.
-          new_rhs->shape(), dnums_a,
-          /*preferred_element_type=*/a->shape().element_type()));
+  ASSIGN_OR_RETURN(Shape new_dot_shape,
+                   ShapeInference::InferDotOpShape(
+                       a_lhs->shape(),  // The new LHS is the LHS of a.
+                       new_rhs->shape(), dnums_a,
+                       /*preferred_element_type=*/a->shape().element_type()));
   *new_dot_shape.mutable_layout() = a->shape().layout();
   HloInstruction* new_dot = a->AddInstruction(HloInstruction::CreateDot(
       new_dot_shape, a_lhs, new_rhs, dnums_a, a->precision_config()));
@@ -416,8 +378,8 @@ absl::StatusOr<HloInstruction*> TryMergeLHSWithRHSOperand(HloInstruction* a,
       HloInstruction::CreateTranspose(b->shape(), new_b_slice, {1, 0}));
   // Important: We do RAUW, not ReplaceInstruction, because the old
   // instruction must live until the end of the pass.
-  TF_RETURN_IF_ERROR(a->ReplaceAllUsesWith(new_a));
-  TF_RETURN_IF_ERROR(b->ReplaceAllUsesWith(new_b));
+  RETURN_IF_ERROR(a->ReplaceAllUsesWith(new_a));
+  RETURN_IF_ERROR(b->ReplaceAllUsesWith(new_b));
 
   return new_dot;
 }
@@ -440,17 +402,6 @@ absl::StatusOr<HloInstruction*> TryMergeOperand(HloInstruction* a,
     return nullptr;
   }
 
-  HloDotInstruction* dot_a = Cast<HloDotInstruction>(a);
-  HloDotInstruction* dot_b = Cast<HloDotInstruction>(b);
-  if (!absl::c_equal(dot_a->sparsity(), dot_b->sparsity(),
-                     protobuf_util::HaveSameSerialization)) {
-    VLOG(3) << "Can't merge dots because they have mismatching sparsity "
-               "descriptors:\n"
-            << "\t" << a->ToString() << "\n"
-            << "\t" << b->ToString();
-    return nullptr;
-  }
-
   auto merged = TryMergeSameOperand(a, b);
   if (!merged.ok() || merged.value() != nullptr) {
     return merged;
@@ -463,10 +414,9 @@ absl::StatusOr<HloInstruction*> TryMergeOperand(HloInstruction* a,
   return TryMergeLHSWithRHSOperand(b, a);
 }
 
-absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
-                               std::function<bool(const HloInstruction* dot_a,
-                                                  const HloInstruction* dot_b)>
-                                   can_merge) {
+absl::StatusOr<bool> MergeDots(
+    HloComputation* comp, int64_t max_size_to_merge,
+    std::function<int64_t(const HloInstruction* dot)> queue_id) {
   auto is_merge_candidate = [&](HloInstruction* instr) {
     int64_t bytes = ShapeUtil::ByteSizeOfElements(instr->shape());
     for (const HloInstruction* operand : instr->operands()) {
@@ -477,13 +427,17 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
 
   // Collect equivalence classes.  Specifically, create the map
   //
-  //   instruction -> [canonical dots that use the instruction].
+  //   instruction, queue_id -> [canonical dots that use the instruction].
+  //
+  // queue_id is backend-specific. Dots with different queue_ids may run
+  // concurrently on different streams and will not be merged.
   //
   // We'll then try to merge dots within each equivalence class.  A dot will be
   // a member of two equivalence classes (because it has two operands), but if
   // it's merged with a dot from one equivalence class, it won't also be merged
   // in another class.
-  absl::flat_hash_map<HloInstruction*, absl::flat_hash_set<HloInstruction*>>
+  absl::flat_hash_map<std::pair<HloInstruction*, int64_t>,
+                      absl::flat_hash_set<HloInstruction*>>
       equivalence_classes;
   for (HloInstruction* instr : comp->instructions()) {
     // Cowardly skip instructions with control dependencies.
@@ -493,11 +447,12 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
       continue;
     }
     for (HloInstruction* operand : instr->operands()) {
-      equivalence_classes[operand].insert(instr);
+      equivalence_classes[{operand, queue_id(instr)}].insert(instr);
       // DotDecomposer inserts transposes to establish a normal form. Transposed
       // operands still count as equivalent.
       if (operand->opcode() == HloOpcode::kTranspose) {
-        equivalence_classes[operand->mutable_operand(0)].insert(instr);
+        equivalence_classes[{operand->mutable_operand(0), queue_id(instr)}]
+            .insert(instr);
       }
     }
   }
@@ -510,7 +465,7 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
   //    us to merge.)
   absl::erase_if(
       equivalence_classes,
-      [&](const std::pair<const HloInstruction*,
+      [&](const std::pair<std::pair<const HloInstruction*, int64_t>,
                           absl::flat_hash_set<HloInstruction*>>& kv) {
         const auto& v = kv.second;
         return v.size() < 2 || absl::c_none_of(v, is_merge_candidate);
@@ -520,6 +475,16 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
   if (equivalence_classes.empty()) {
     return false;
   }
+
+  VLOG(1) << "Merging Dots in computation: " << comp->name();
+  VLOG(1) << "Found " << equivalence_classes.size()
+          << " equivalence classes with "
+          << std::accumulate(equivalence_classes.begin(),
+                             equivalence_classes.end(), std::uint64_t{0},
+                             [](std::uint64_t total, auto const& values) {
+                               return values.second.size() + total;
+                             })
+          << " dots in total.";
 
   // Build a dependency graph representing the whole computation.
   GraphCycles graph;
@@ -553,13 +518,14 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
   // them earlier because removing an instruction deletes it; we'd then have
   // dangling pointers in our hashtable!)
   absl::flat_hash_set<HloInstruction*> dead_instrs;
-  std::vector<HloInstruction*> keys;
+  std::vector<std::pair<HloInstruction*, int64_t>> keys;
   keys.reserve(equivalence_classes.size());
   for (auto& kv : equivalence_classes) {
     keys.push_back(kv.first);
   }
-  absl::c_sort(keys, [](const HloInstruction* a, const HloInstruction* b) {
-    return a->unique_id() < b->unique_id();
+  absl::c_sort(keys, [](std::pair<const HloInstruction*, int64_t> a,
+                        std::pair<const HloInstruction*, int64_t> b) {
+    return a.first->unique_id() < b.first->unique_id();
   });
   for (auto key : keys) {
     const auto& values = equivalence_classes[key];
@@ -587,11 +553,11 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
             (!is_merge_candidate(a) && !is_merge_candidate(b)) ||
             // Perform reachability checks last since they can be expensive.
             graph.IsReachableNonConst(a_id, b_id) ||
-            graph.IsReachableNonConst(b_id, a_id) || !can_merge(a, b)) {
+            graph.IsReachableNonConst(b_id, a_id)) {
           continue;
         }
 
-        TF_ASSIGN_OR_RETURN(HloInstruction * merged, TryMergeOperand(a, b));
+        ASSIGN_OR_RETURN(HloInstruction * merged, TryMergeOperand(a, b));
         if (merged != nullptr) {
           int32_t merged_id = graph_id(merged);
           graph.InsertEdge(a_id, merged_id);
@@ -612,9 +578,19 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
     }
   }
 
-  // Now it's finally safe to delete the old instructions from the graph.
-  for (HloInstruction* instr : dead_instrs) {
-    TF_RETURN_IF_ERROR(comp->RemoveInstruction(instr));
+  // Now it's finally safe to delete the old instructions from the graph. We
+  // need to sort by unique id again to make the removal order deterministic.
+  // Otherwise the users list of HloInstructions would be non-deterministic, as
+  // removal works by swapping with the last element of the vector and then
+  // popping the last element.
+  std::vector<HloInstruction*> sorted_dead_instrs(dead_instrs.begin(),
+                                                  dead_instrs.end());
+  absl::c_sort(sorted_dead_instrs,
+               [](const HloInstruction* a, const HloInstruction* b) {
+                 return a->unique_id() < b->unique_id();
+               });
+  for (HloInstruction* instr : sorted_dead_instrs) {
+    RETURN_IF_ERROR(comp->RemoveInstruction(instr));
   }
 
   return !dead_instrs.empty();
@@ -622,14 +598,14 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,
 
 }  // anonymous namespace
 
-absl::StatusOr<bool> DotMerger::Run(
+absl::StatusOr<bool> DotMerger::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   bool changed = false;
   for (HloComputation* comp :
        module->MakeNonfusionComputations(execution_threads)) {
-    TF_ASSIGN_OR_RETURN(bool changed_computation,
-                        MergeDots(comp, max_size_to_merge_, can_merge_));
+    ASSIGN_OR_RETURN(bool changed_computation,
+                     MergeDots(comp, max_size_to_merge_, queue_id_));
     changed |= changed_computation;
   }
   return changed;

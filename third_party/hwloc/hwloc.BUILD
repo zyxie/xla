@@ -51,6 +51,7 @@ expand_template(
     out = "include/hwloc/autogen/config.h",
     substitutions = select({
         "@xla//xla/tsl:linux_x86_64": _INCLUDE_HWLOC_AUTOIGEN_CONFIG_H_LINUX_SUBS,
+        "@xla//xla/tsl:linux_aarch64": _INCLUDE_HWLOC_AUTOIGEN_CONFIG_H_LINUX_SUBS,
         "//conditions:default": _INCLUDE_HWLOC_AUTOIGEN_CONFIG_H_COMMON_SUBS,
     }),
     template = "include/hwloc/autogen/config.h.in",
@@ -272,6 +273,10 @@ cc_library(
             "hwloc/topology-linux.c",
             "include/hwloc/linux.h",
         ],
+        "@xla//xla/tsl:linux_riscv64": [
+            "hwloc/topology-linux.c",
+            "include/hwloc/linux.h",
+        ],
         "@xla//xla/tsl:linux_s390x": [
             "hwloc/topology-linux.c",
             "include/hwloc/linux.h",
@@ -297,7 +302,9 @@ cc_library(
         "include/hwloc/memattrs.h",
         "include/hwloc/rename.h",
     ],
-    copts = COMMON_INCLUDE_COPTS + DISABLE_WARNINGS_COPTS + VAR_SETTINGS_COPTS,
+    copts = COMMON_INCLUDE_COPTS + DISABLE_WARNINGS_COPTS + VAR_SETTINGS_COPTS + [
+        "-fvisibility=hidden",
+    ],
     features = [
         "-parse_headers",
         "-layering_check",

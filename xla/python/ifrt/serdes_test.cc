@@ -22,22 +22,21 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ExtensibleRTTI.h"
 #include "xla/python/ifrt/serdes.pb.h"
 #include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
 namespace {
-
-using ::tsl::testing::StatusIs;
 
 struct TestNumberSerializeOptions;
 struct TestNumberDeserializeOptions;
@@ -85,7 +84,7 @@ class TestNumberSerDes : public llvm::RTTIExtends<TestNumberSerDes, SerDes> {
     if (options != nullptr) {
       auto* serialize_options =
           llvm::cast<TestNumberSerializeOptions>(options.get());
-      TF_RETURN_IF_ERROR(serialize_options->injected_failure);
+      RETURN_IF_ERROR(serialize_options->injected_failure);
     }
     const TestNumber& obj = llvm::cast<TestNumber>(serializable);
     return absl::StrCat(obj.number);
@@ -97,7 +96,7 @@ class TestNumberSerDes : public llvm::RTTIExtends<TestNumberSerDes, SerDes> {
     if (options != nullptr) {
       auto* deserialize_options =
           llvm::cast<TestNumberDeserializeOptions>(options.get());
-      TF_RETURN_IF_ERROR(deserialize_options->injected_failure);
+      RETURN_IF_ERROR(deserialize_options->injected_failure);
     }
 
     int number;
@@ -133,8 +132,9 @@ TEST_F(TestNumberTest, WithSerializeOptions) {
   auto obj = std::make_unique<TestNumber>(1234);
   auto options = std::make_unique<TestNumberSerializeOptions>();
   options->injected_failure = absl::InternalError("injected failure");
-  EXPECT_THAT(Serialize(*obj, std::move(options)),
-              StatusIs(absl::StatusCode::kInternal, "injected failure"));
+  EXPECT_THAT(
+      Serialize(*obj, std::move(options)),
+      absl_testing::StatusIs(absl::StatusCode::kInternal, "injected failure"));
 }
 
 TEST_F(TestNumberTest, WithDeserializeOptions) {
@@ -144,8 +144,9 @@ TEST_F(TestNumberTest, WithDeserializeOptions) {
 
   auto options = std::make_unique<TestNumberDeserializeOptions>();
   options->injected_failure = absl::InternalError("injected failure");
-  EXPECT_THAT(Deserialize<TestNumber>(serialized, std::move(options)),
-              StatusIs(absl::StatusCode::kInternal, "injected failure"));
+  EXPECT_THAT(
+      Deserialize<TestNumber>(serialized, std::move(options)),
+      absl_testing::StatusIs(absl::StatusCode::kInternal, "injected failure"));
 }
 
 }  // namespace

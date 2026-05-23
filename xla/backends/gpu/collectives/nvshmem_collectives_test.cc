@@ -24,12 +24,16 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "third_party/gpus/cuda/include/cuda_runtime_api.h"
+#include "xla/core/collectives/communicator.h"
 #include "xla/debug_options_flags.h"
 #include "xla/pjrt/distributed/client.h"
 #include "xla/pjrt/distributed/distributed.h"
 #include "xla/pjrt/distributed/service.h"
+#include "xla/runtime/process_id.h"
 #include "xla/status_macros.h"
+#include "xla/stream_executor/cuda/nvshmem.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/status.h"
 #include "xla/tsl/platform/statusor.h"
@@ -69,8 +73,8 @@ absl::Status InitializationTestBody(const int node_id, const int num_nodes) {
   if (node_id == 0) {
     xla::CoordinationServiceImpl::Options service_options;
     service_options.num_nodes = num_nodes;
-    TF_ASSIGN_OR_RETURN(service, xla::GetDistributedRuntimeService(
-                                     "[::]:12345", service_options));
+    ASSIGN_OR_RETURN(service, xla::GetDistributedRuntimeService(
+                                  "[::]:12345", service_options));
   }
 
   xla::DistributedRuntimeClient::Options distributed_options;
@@ -82,13 +86,13 @@ absl::Status InitializationTestBody(const int node_id, const int num_nodes) {
   auto kv_store =
       GetDistributedKeyValueStore(distributed_client, /*key_prefix=*/"gpu:");
 
-  NvshmemCollectives::Default()->SetEnvInfo(node_id, num_nodes, 1, kv_store);
+  se::gpu::nvshmem::SetEnvInfo(ProcessId(node_id), num_nodes, 1, kv_store);
   cudaSetDevice(node_id);
-  TF_ASSIGN_OR_RETURN(void* ptr, NvshmemCollectives::Default()->Allocate(1024));
+  ASSIGN_OR_RETURN(void* ptr, NvshmemCollectives::Default()->Allocate(1024));
   TF_RET_CHECK(ptr != nullptr);
-  TF_RETURN_IF_ERROR(NvshmemCollectives::Default()->Deallocate(ptr));
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<Communicator> comm,
-                      NvshmemCollectives::Default()->CreateCommunicator());
+  RETURN_IF_ERROR(NvshmemCollectives::Default()->Deallocate(ptr));
+  ASSIGN_OR_RETURN(std::unique_ptr<Communicator> comm,
+                   NvshmemCollectives::Default()->CreateCommunicator());
   TF_RET_CHECK(*comm->NumRanks() == num_nodes);
   TF_RET_CHECK(*comm->CurrentRank() == node_id);
   return absl::OkStatus();

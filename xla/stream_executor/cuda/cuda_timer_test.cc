@@ -22,22 +22,21 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/time/time.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
-#include "xla/stream_executor/device_memory.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/gpu/gpu_test_kernels.h"
 #include "xla/stream_executor/kernel.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
-#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor::gpu {
 namespace {
 using ::testing::Gt;
-using ::tsl::testing::IsOk;
 
 class CudaTimerTest : public ::testing::TestWithParam<CudaTimer::TimerType> {
  public:
@@ -48,15 +47,16 @@ class CudaTimerTest : public ::testing::TestWithParam<CudaTimer::TimerType> {
     int64_t byte_length = sizeof(int32_t) * length;
 
     // Prepare arguments: a=1, b=2, c=0
-    DeviceMemory<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
-    DeviceMemory<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
-    DeviceMemory<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
+    DeviceAddress<int32_t> a = executor->AllocateArray<int32_t>(length, 0);
+    DeviceAddress<int32_t> b = executor->AllocateArray<int32_t>(length, 0);
+    DeviceAddress<int32_t> c = executor->AllocateArray<int32_t>(length, 0);
 
-    ASSERT_THAT(stream->Memset32(&a, 1, byte_length), IsOk());
-    ASSERT_THAT(stream->Memset32(&b, 2, byte_length), IsOk());
-    ASSERT_THAT(stream->MemZero(&c, byte_length), IsOk());
+    ASSERT_THAT(stream->Memset32(&a, 1, byte_length), absl_testing::IsOk());
+    ASSERT_THAT(stream->Memset32(&b, 2, byte_length), absl_testing::IsOk());
+    ASSERT_THAT(stream->MemZero(&c, byte_length), absl_testing::IsOk());
 
-    ASSERT_THAT(add.Launch(ThreadDim(), BlockDim(4), stream, a, b, c), IsOk());
+    ASSERT_THAT(add.Launch(ThreadDim(), BlockDim(4), stream, a, b, c),
+                absl_testing::IsOk());
   }
 
   StreamExecutor* executor_;
@@ -84,7 +84,7 @@ TEST_P(CudaTimerTest, Create) {
                           timer.GetElapsedDuration());
   EXPECT_THAT(timer_result, Gt(absl::ZeroDuration()));
   EXPECT_THAT(timer.GetElapsedDuration(),
-              tsl::testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
 INSTANTIATE_TEST_SUITE_P(CudaTimerTest, CudaTimerTest,

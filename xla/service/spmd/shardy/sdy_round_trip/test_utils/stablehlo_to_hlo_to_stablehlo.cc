@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -33,6 +34,7 @@ limitations under the License.
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Support/TypeID.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/translate/register.h"
 #include "xla/hlo/translate/stablehlo.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_module_config.h"
@@ -48,8 +50,8 @@ using ::mlir::StringRef;
 
 // Converts a StableHLO module to an HLO module.
 absl::StatusOr<std::unique_ptr<HloModule>> toHlo(ModuleOp module) {
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hloModule,
-                      xla::ConvertStablehloToHlo(module));
+  ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hloModule,
+                   xla::ConvertStablehloToHlo(module));
   hloModule->mutable_config().set_use_spmd_partitioning(true);
   return hloModule;
 }
@@ -57,7 +59,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> toHlo(ModuleOp module) {
 // Converts an HLO module to a StableHLO module.
 absl::Status toStablehlo(std::unique_ptr<HloModule> hloModule,
                          ModuleOp& module) {
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       mlir::OwningOpRef<mlir::ModuleOp> newModule,
       xla::ConvertHloToStablehlo(*module->getContext(), hloModule.get()));
   // Erase the old body region and replace it with the new one.

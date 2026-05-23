@@ -25,6 +25,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/hlo/ir/dfs_hlo_visitor.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -40,6 +41,8 @@ namespace hlo_diff {
 struct HloGumgraphFingerprintOptions {
   // Ignore shape when computing the instruction fingerprint.
   bool ignore_shape = false;
+  // Ignore backend config when computing the instruction fingerprint.
+  bool ignore_backend_config = true;
 };
 
 // A directed acyclic graph representation of an HloModule with all called
@@ -51,7 +54,8 @@ class HloGumgraph {
   // various graph properties such as height, siblings per node etc.
   static absl::StatusOr<std::unique_ptr<const HloGumgraph>> Create(
       const HloModule* absl_nonnull hlo_module,
-      const HloGumgraphFingerprintOptions& fingerprint_options = {});
+      const HloGumgraphFingerprintOptions& fingerprint_options = {},
+      bool precompute_instruction_dependencies = true);
 
   // HloGumgraph is neither copyable nor movable as it can be really large.
   HloGumgraph(const HloGumgraph&) = delete;
@@ -67,8 +71,19 @@ class HloGumgraph {
   // nullptr if the instruction is not in the graph.
   inline HloInstructionNode* GetNode(
       const HloInstruction* absl_nonnull instruction) const {
-    if (auto it = instruction_to_node_.find(instruction);
-        it != instruction_to_node_.end()) {
+    if (auto it = instruction_name_to_node_.find(instruction->name());
+        it != instruction_name_to_node_.end()) {
+      return it->second.get();
+    }
+    return nullptr;
+  }
+
+  // Returns graph node corresponding to the given HloInstruction name. Returns
+  // nullptr if the instruction is not in the graph.
+  inline HloInstructionNode* GetNode(
+      const absl::string_view instruction) const {
+    if (auto it = instruction_name_to_node_.find(instruction);
+        it != instruction_name_to_node_.end()) {
       return it->second.get();
     }
     return nullptr;
@@ -77,14 +92,20 @@ class HloGumgraph {
   // Returns all nodes in the graph excluding the dummy root node.
   inline std::vector<HloInstructionNode*> AllNodes() const {
     std::vector<HloInstructionNode*> nodes;
-    for (const auto& [_, node] : instruction_to_node_) {
+    for (const auto& [_, node] : instruction_name_to_node_) {
       nodes.push_back(node.get());
     }
+    std::sort(nodes.begin(), nodes.end(),
+              [](const HloInstructionNode* a, const HloInstructionNode* b) {
+                return a->unique_node_index < b->unique_node_index;
+              });
     return nodes;
   }
 
   // Returns the number of nodes in the graph including the dummy root node.
-  inline int GetNodeCount() const { return instruction_to_node_.size() + 1; }
+  inline int GetNodeCount() const {
+    return instruction_name_to_node_.size() + 1;
+  }
 
   // Returns all properties of computations in the graph.
   inline const absl::flat_hash_map<const HloComputation*, CallGraphNodeProps>&
@@ -155,9 +176,8 @@ class HloGumgraph {
   const HloModule& hlo_module_;
   const HloGumgraphFingerprintOptions& fingerprint_options_;
   HloInstructionNode root_;
-  absl::flat_hash_map<const HloInstruction*,
-                      std::unique_ptr<HloInstructionNode>>
-      instruction_to_node_;
+  absl::flat_hash_map<absl::string_view, std::unique_ptr<HloInstructionNode>>
+      instruction_name_to_node_;
   absl::flat_hash_map<const HloComputation*, CallGraphNodeProps>
       computation_to_props_;
   std::vector<std::vector<HloInstructionNode*>> nodes_by_generation_;

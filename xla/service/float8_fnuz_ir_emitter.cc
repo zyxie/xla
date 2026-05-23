@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <string>
 
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Intrinsics.h"
@@ -116,11 +117,11 @@ absl::StatusOr<uint64_t> ComputeMaximumValue(PrimitiveType input_type,
   TF_RET_CHECK(primitive_util::IsFloatingPointType(output_type));
   TF_RET_CHECK(BitWidth(input_type) > BitWidth(output_type));
 
-  TF_ASSIGN_OR_RETURN(auto output_semantics,
-                      PrimitiveTypeToAPFloatSemantics(output_type));
+  ASSIGN_OR_RETURN(auto output_semantics,
+                   PrimitiveTypeToAPFloatSemantics(output_type));
 
-  TF_ASSIGN_OR_RETURN(auto input_semantics,
-                      PrimitiveTypeToAPFloatSemantics(input_type));
+  ASSIGN_OR_RETURN(auto input_semantics,
+                   PrimitiveTypeToAPFloatSemantics(input_type));
 
   // Compute the largest number of the output type and convert it to the input
   // type.
@@ -160,8 +161,8 @@ absl::StatusOr<llvm::Value*> IsInputOutsideOutputRange(
   // Ignore the sign bit.
   llvm::Value* non_sign_bits = b->CreateAnd(value, bit_mask);
 
-  TF_ASSIGN_OR_RETURN(uint64_t maximum_value,
-                      ComputeMaximumValue(input_type, output_type, b));
+  ASSIGN_OR_RETURN(uint64_t maximum_value,
+                   ComputeMaximumValue(input_type, output_type, b));
 
   // Compare against the maximum value.
   llvm::Type* uint_type = b->getIntNTy(BitWidth(input_type));
@@ -389,8 +390,8 @@ absl::StatusOr<llvm::Value*> DynamicRoundingBias(PrimitiveType input_type,
   llvm::Type* int_type = b->getIntNTy(BitWidth(input_type));
 
   // Find the bit position of the last mantissa bit.
-  TF_ASSIGN_OR_RETURN(llvm::Value * shift,
-                      LastMantissaBit(input_type, value, output_type, b));
+  ASSIGN_OR_RETURN(llvm::Value * shift,
+                   LastMantissaBit(input_type, value, output_type, b));
 
   // Compute the mask to select that bit.
   llvm::Value* last_mantissa_bit_mask =
@@ -511,75 +512,11 @@ llvm::Value* BuildOutputSign(llvm::Value* sign, PrimitiveType output_type,
 }
 
 absl::StatusOr<uint64_t> GetQNaN(PrimitiveType type) {
-  TF_ASSIGN_OR_RETURN(auto semantics, PrimitiveTypeToAPFloatSemantics(type));
+  ASSIGN_OR_RETURN(auto semantics, PrimitiveTypeToAPFloatSemantics(type));
 
   return llvm::APFloat::getQNaN(*semantics).bitcastToAPInt().getZExtValue();
 }
 }  // namespace
-
-absl::StatusOr<llvm::Value*> EmitFloatingToF8fnuz(PrimitiveType input_type,
-                                                  llvm::Value* input_value,
-                                                  PrimitiveType output_type,
-                                                  llvm::IRBuilderBase* b) {
-  // Sanity check for supported types.
-  TF_RET_CHECK(input_type == BF16 || input_type == F16 || input_type == F32 ||
-               input_type == F64);
-  TF_RET_CHECK(output_type == F8E4M3FNUZ || output_type == F8E5M2FNUZ);
-
-  llvm::IntegerType* input_int_type = b->getIntNTy(BitWidth(input_type));
-  llvm::Value* input_uint = b->CreateBitCast(input_value, input_int_type);
-
-  TF_ASSIGN_OR_RETURN(
-      llvm::Value * out_of_range_pred,
-      IsInputOutsideOutputRange(input_type, input_uint, output_type, b));
-  // We may now assume there won't be any further overflow issues. They will be
-  // handled in the final select.
-
-  // Compute rounding bias for round-to-nearest with ties to even.
-  TF_ASSIGN_OR_RETURN(
-      llvm::Value * input_rounding_bias,
-      DynamicRoundingBias(input_type, input_uint, output_type, b));
-
-  // Apply the rounding bias to the input. This won't carry into the sign bit.
-  llvm::Value* input_uint_rounded =
-      b->CreateAdd(input_uint, input_rounding_bias);
-
-  // The input value is broken down and in a canonical form. Appropriate
-  // rounding has been applied, exponent is not biased, and there are no
-  // implicit bits in the mantissa.
-  llvm::Value* sign =
-      ExtractSign(input_type, input_uint, /*preserve_signed_zero=*/false, b);
-  llvm::Value* exponent = ExtractExponent(input_type, input_uint_rounded, b);
-  llvm::Value* mantissa = ExtractMantissa(input_type, input_uint_rounded, b);
-
-  // The component parts of the output value.
-  llvm::Value* output_sign = BuildOutputSign(sign, output_type, b);
-  llvm::Value* output_exponent =
-      BuildOutputExponent(input_type, exponent, mantissa, output_type, b);
-  llvm::Value* output_mantissa =
-      BuildOutputMantissa(input_type, exponent, mantissa, output_type, b);
-
-  // Bitwise or the output components together.
-  llvm::Value* result = b->CreateOr(output_exponent, output_mantissa);
-
-  // Check for output underflow before adding a sign bit. There's no -0 in
-  // fnuz types.
-  llvm::Value* is_zero_pred = IsZero(input_type, result, b);
-  output_sign = b->CreateSelect(
-      is_zero_pred, llvm::ConstantInt::get(input_int_type, 0x0u), output_sign);
-
-  // Bitwise or the sign bit into the result.
-  result = b->CreateOr(result, output_sign);
-
-  // Truncate down to int8.
-  result = b->CreateTrunc(result, b->getInt8Ty());
-
-  // Select based on whether the value was in range.
-  TF_ASSIGN_OR_RETURN(const uint64_t output_qnan, GetQNaN(output_type));
-  return b->CreateSelect(out_of_range_pred,
-                         llvm::ConstantInt::get(b->getInt8Ty(), output_qnan),
-                         result);
-}
 
 absl::StatusOr<llvm::Value*> EmitF8fnuzToFloating(PrimitiveType input_type,
                                                   llvm::Value* f8_value,
@@ -598,10 +535,10 @@ absl::StatusOr<llvm::Value*> EmitF8fnuzToFloating(PrimitiveType input_type,
 
   const std::string lut_name = PrimitiveType_Name(input_type) + "To" +
                                PrimitiveType_Name(output_type) + "LUT";
-  TF_ASSIGN_OR_RETURN(auto input_semantics,
-                      PrimitiveTypeToAPFloatSemantics(input_type));
-  TF_ASSIGN_OR_RETURN(auto output_semantics,
-                      PrimitiveTypeToAPFloatSemantics(output_type));
+  ASSIGN_OR_RETURN(auto input_semantics,
+                   PrimitiveTypeToAPFloatSemantics(input_type));
+  ASSIGN_OR_RETURN(auto output_semantics,
+                   PrimitiveTypeToAPFloatSemantics(output_type));
 
   llvm::Constant* global_result_lut_array = module->getOrInsertGlobal(
       lut_name, result_lut_array_type, [&]() -> llvm::GlobalVariable* {
@@ -634,7 +571,7 @@ absl::StatusOr<llvm::Value*> EmitF8fnuzToFloating(PrimitiveType input_type,
       });
 
   // Check for NaN, since it's a special case.
-  TF_ASSIGN_OR_RETURN(const uint64_t input_qnan, GetQNaN(input_type));
+  ASSIGN_OR_RETURN(const uint64_t input_qnan, GetQNaN(input_type));
   llvm::Value* nan_pred = b->CreateICmpEQ(
       f8_value, llvm::ConstantInt::get(b->getInt8Ty(), input_qnan));
 
@@ -667,8 +604,8 @@ absl::StatusOr<llvm::Value*> EmitF8fnuzToFloating(PrimitiveType input_type,
   llvm::Value* result = b->CreateOr(sign, result_abs);
 
   // Bitcast to the output type.
-  TF_ASSIGN_OR_RETURN(auto type, PrimitiveTypeToLLVMType(b, output_type));
-  TF_ASSIGN_OR_RETURN(const uint64_t output_qnan, GetQNaN(output_type));
+  ASSIGN_OR_RETURN(auto type, PrimitiveTypeToLLVMType(b, output_type));
+  ASSIGN_OR_RETURN(const uint64_t output_qnan, GetQNaN(output_type));
   return b->CreateBitCast(
       b->CreateSelect(nan_pred,
                       llvm::ConstantInt::get(output_int_type, output_qnan),

@@ -21,6 +21,7 @@ limitations under the License.
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/pjrt/c/pjrt_c_api_wrapper_impl.h"
 #include "xla/pjrt/raw_buffer.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -51,6 +52,14 @@ PJRT_Error* PJRT_RawBuffer_Destroy(PJRT_RawBuffer_Destroy_Args* args) {
   delete args->buffer;
   return nullptr;
 }
+PJRT_Error* PJRT_RawBuffer_GetHostPointer(
+    PJRT_RawBuffer_GetHostPointer_Args* args) {
+  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
+      "PJRT_RawBuffer_GetHostPointer_Args",
+      PJRT_RawBuffer_GetHostPointer_Args_STRUCT_SIZE, args->struct_size));
+  args->host_pointer = args->buffer->buffer->GetHostPointer();
+  return nullptr;
+}
 PJRT_Error* PJRT_RawBuffer_GetOnDeviceSizeInBytes(
     PJRT_RawBuffer_GetOnDeviceSizeInBytes_Args* args) {
   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(
@@ -69,8 +78,8 @@ PJRT_Error* PJRT_RawBuffer_GetMemorySpace(
   args->memory_space = PJRT_Client_FindMemoryWrapper(
       args->buffer->buffer->memory_space(), args->buffer->client);
   if (args->memory_space == nullptr) {
-    return new PJRT_Error{
-        absl::UnimplementedError("Could find memory_space() for RawBuffer")};
+    return StatusToPjRtError(absl::UnimplementedError(
+        "Could not find memory_space() for RawBuffer"));
   }
   return nullptr;
 }
@@ -113,6 +122,8 @@ PJRT_RawBuffer_Extension CreateRawBufferExtension(PJRT_Extension_Base* next) {
       pjrt::PJRT_RawBuffer_CopyRawHostToDevice,
       /*PJRT_RawBuffer_CopyRawDeviceToHost=*/
       pjrt::PJRT_RawBuffer_CopyRawDeviceToHost,
+      /*PJRT_RawBuffer_GetHostPointer=*/
+      pjrt::PJRT_RawBuffer_GetHostPointer,
   };
 }
 

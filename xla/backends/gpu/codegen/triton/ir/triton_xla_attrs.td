@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_BACKENDS_GPU_CODEGEN_TRITON_IR_TRITON_XLA_ATTRS_TD_
 
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/EnumAttr.td"
 include "xla/backends/gpu/codegen/triton/ir/triton_xla_dialect.td"
 
@@ -68,5 +69,20 @@ def XLA_TmaDescriptorAttr : TTXLA_Attr<"TmaDescriptor"> {
       }]>
   ];
 }
+
+def TTXLA_ComparatorEnum : I32Enum<"Comparator",
+    "A comparison operator for instructions.",
+    [
+      I32EnumCase<"EQ", 0, "equal_to">,
+      I32EnumCase<"LT", 1, "less_than">,
+      I32EnumCase<"LE", 2, "less_than_or_equal_to">,
+      I32EnumCase<"GT", 3, "greater_than">,
+      I32EnumCase<"GE", 4, "greater_than_or_equal_to">,
+      // Extend if required.
+    ]> {
+  let cppNamespace = "::mlir::triton::xla";
+}
+def TTXLA_ComparatorAttr : EnumAttr<XlaTritonDialect, TTXLA_ComparatorEnum, "">;
+
 
 #endif // XLA_BACKENDS_GPU_CODEGEN_TRITON_IR_TRITON_XLA_ATTRS_TD_

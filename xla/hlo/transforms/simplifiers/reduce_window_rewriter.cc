@@ -28,15 +28,22 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/transforms/simplifiers/reduce_window_util.h"
+#include "xla/hlo/utils/hlo_query.h"
+#include "xla/literal_util.h"
+#include "xla/service/hlo.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/status_macros.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
@@ -45,112 +52,154 @@ limitations under the License.
 
 namespace xla {
 
+// Returns true if all the shapes in the computation are scalars or tuples of
+// scalars. Nested tuples are not supported.
+static bool IsAlreadyScalar(const HloComputation* comp) {
+  for (const HloInstruction* inst : comp->instructions()) {
+    if (inst->shape().IsTuple()) {
+      for (const Shape& subshape : inst->shape().tuple_shapes()) {
+        if (!ShapeUtil::IsScalar(subshape)) {
+          return false;
+        }
+      }
+    } else if (!ShapeUtil::IsScalar(inst->shape())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static absl::StatusOr<HloComputation*> ScalarizeComputation(
+    HloComputation* comp, HloComputation* parent_for_embedded) {
+  if (IsAlreadyScalar(comp)) {
+    return comp;
+  }
+
+  absl::flat_hash_map<const HloInstruction*, HloInstruction*> replacements;
+  HloComputation::Builder builder(absl::StrCat(comp->name(), "_scalarized"));
+
+  auto get_scalar_shape = [](const Shape& shape) -> absl::StatusOr<Shape> {
+    if (!shape.IsTuple()) {
+      return ShapeUtil::MakeScalarShape(shape.element_type());
+    }
+    std::vector<Shape> subshapes;
+    subshapes.reserve(shape.tuple_shapes().size());
+    for (const Shape& subshape : shape.tuple_shapes()) {
+      TF_RET_CHECK(!subshape.IsTuple())
+          << "Only one level of nesting is supported.";
+      subshapes.push_back(ShapeUtil::MakeScalarShape(subshape.element_type()));
+    }
+    return ShapeUtil::MakeTupleShape(subshapes);
+  };
+
+  auto get_mapped_operands = [&](const HloInstruction* inst) {
+    std::vector<HloInstruction*> operands;
+    operands.reserve(inst->operand_count());
+    for (HloInstruction* op : inst->operands()) {
+      operands.push_back(replacements[op]);
+    }
+    return operands;
+  };
+
+  for (HloInstruction* inst : comp->MakeInstructionPostOrder()) {
+    HloInstruction* new_inst = nullptr;
+    switch (inst->opcode()) {
+      case HloOpcode::kParameter: {
+        ASSIGN_OR_RETURN(Shape shape, get_scalar_shape(inst->shape()));
+        new_inst = builder.AddInstruction(HloInstruction::CreateParameter(
+            inst->parameter_number(), shape, inst->name()));
+        break;
+      }
+      case HloOpcode::kTuple:
+        new_inst = builder.AddInstruction(
+            HloInstruction::CreateTuple(get_mapped_operands(inst)));
+        break;
+      case HloOpcode::kGetTupleElement: {
+        ASSIGN_OR_RETURN(Shape shape, get_scalar_shape(inst->shape()));
+        new_inst = builder.AddInstruction(HloInstruction::CreateGetTupleElement(
+            shape, replacements[inst->operand(0)], inst->tuple_index()));
+        break;
+      }
+      case HloOpcode::kConstant:
+        if (!inst->shape().IsArray()) {
+          return absl::InvalidArgumentError("Constant is not an array.");
+        }
+        if (ShapeUtil::IsScalar(inst->shape())) {
+          new_inst = builder.AddInstruction(
+              HloInstruction::CreateConstant(inst->literal().Clone()));
+        } else if (inst->literal().IsAllFirst()) {
+          new_inst = builder.AddInstruction(HloInstruction::CreateConstant(
+              LiteralUtil::GetFirstScalarLiteral(inst->literal())));
+        } else {
+          return absl::InvalidArgumentError("Constant is not uniform.");
+        }
+        break;
+      case HloOpcode::kBroadcast:
+        if (!ShapeUtil::IsScalar(inst->operand(0)->shape())) {
+          return absl::InvalidArgumentError(
+              "Broadcast operand is not a scalar.");
+        }
+        new_inst = replacements[inst->operand(0)];
+        break;
+      case HloOpcode::kBitcast:
+        if (inst->operand(0)->shape().element_type() !=
+            inst->shape().element_type()) {
+          return absl::InvalidArgumentError("Bitcast changes element type.");
+        }
+        new_inst = replacements[inst->operand(0)];
+        break;
+      case HloOpcode::kReshape:
+        new_inst = replacements[inst->operand(0)];
+        break;
+      default: {
+        if (!inst->IsElementwise()) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("Instruction is not elementwise: ",
+                           HloOpcodeString(inst->opcode())));
+        }
+        ASSIGN_OR_RETURN(Shape shape, get_scalar_shape(inst->shape()));
+        new_inst = builder.AddInstruction(
+            inst->CloneWithNewOperands(shape, get_mapped_operands(inst)));
+        break;
+      }
+    }
+    replacements[inst] = new_inst;
+  }
+  return parent_for_embedded->parent()->AddEmbeddedComputation(
+      builder.Build(replacements[comp->root_instruction()]));
+}
+
+static absl::StatusOr<HloInstruction*> GetScalarInitValue(
+    HloInstruction* init, HloComputation* parent) {
+  while (HloPredicateIsOp<HloOpcode::kBroadcast, HloOpcode::kReshape,
+                          HloOpcode::kBitcast>(init)) {
+    if (init->opcode() == HloOpcode::kBitcast &&
+        init->shape().element_type() !=
+            init->operand(0)->shape().element_type()) {
+      return absl::InvalidArgumentError(
+          "Bitcast changes element type, cannot extract scalar init value.");
+    }
+    init = init->mutable_operand(0);
+  }
+  if (ShapeUtil::IsScalar(init->shape())) {
+    return init;
+  }
+  if (init->opcode() != HloOpcode::kConstant) {
+    return absl::InvalidArgumentError("Init value is not a constant.");
+  }
+  if (!init->literal().IsAllFirst()) {
+    return absl::InvalidArgumentError("Init value is a non-uniform constant.");
+  }
+  return parent->AddInstruction(HloInstruction::CreateConstant(
+      LiteralUtil::GetFirstScalarLiteral(init->literal())));
+}
+
 static size_t FlattenShapeIndex(const ShapeIndex& shape_index) {
   if (shape_index.empty()) {
     return 0;
   }
   CHECK_EQ(shape_index.size(), 1);
   return shape_index.back();
-}
-
-static Shape ShapeAtIndex(const Shape& shape, const ShapeIndex& shape_index) {
-  if (shape_index.empty()) {
-    return shape;
-  }
-  CHECK_EQ(shape_index.size(), 1);
-  return ShapeUtil::GetTupleElementShape(shape, shape_index.back());
-}
-
-static HloInstruction* GetAtIndex(HloInstruction* hlo,
-                                  const ShapeIndex& shape_index) {
-  if (shape_index.empty()) {
-    return hlo;
-  }
-  CHECK_EQ(shape_index.size(), 1);
-  return hlo->parent()->AddInstruction(HloInstruction::CreateGetTupleElement(
-      ShapeAtIndex(hlo->shape(), shape_index), hlo, shape_index.back()));
-}
-
-// Transform reduce-win(x) ->
-//   if rank(x) == 1:
-//   then: reshape_r2_r1(reduce-win(reshape_r1_r2(x)))
-//   else: no change
-absl::Status ReduceWindowRewriter::ReplaceReduceWindowWithReshape(
-    HloReduceWindowInstruction* reduce_window) {
-  VLOG(2) << "Converting R1 reduce window: " << reduce_window->ToString();
-
-  std::vector<Shape> r2_output_shapes;
-  ShapeUtil::ForEachSubshape(
-      reduce_window->shape(),
-      [&](const Shape& subshape, const ShapeIndex& shape_index) {
-        if (!ShapeUtil::IsLeafIndex(reduce_window->shape(), shape_index)) {
-          return;
-        }
-        Shape r2_output_shape = subshape;
-        ShapeUtil::AppendMajorDimension(1, &r2_output_shape);
-        UpdateLayout(&r2_output_shape);
-        r2_output_shapes.push_back(r2_output_shape);
-
-        VLOG(2) << "ReduceWindowRewriter: Converting R2 result to R1: "
-                << ShapeUtil::HumanStringWithLayout(r2_output_shape);
-      });
-
-  Window r2_window = reduce_window->window();
-  WindowDimension* dim = r2_window.add_dimensions();
-  dim->set_size(1);
-  dim->set_stride(1);
-  dim->set_base_dilation(1);
-  dim->set_window_dilation(1);
-
-  std::vector<HloInstruction*> r2_operands;
-  for (HloInstruction* operand : reduce_window->inputs()) {
-    Shape r2_input_shape = operand->shape();
-    ShapeUtil::AppendMajorDimension(1, &r2_input_shape);
-    UpdateLayout(&r2_input_shape);
-
-    VLOG(2) << "ReduceWindowRewriter: Converting R1 operand to R2: "
-            << ShapeUtil::HumanStringWithLayout(r2_input_shape);
-    HloInstruction* r2_operand = operand->parent()->AddInstruction(
-        HloInstruction::CreateReshape(r2_input_shape, operand));
-    VLOG(2) << "R2 new operand: " << r2_operand->ToString();
-    r2_operands.push_back(r2_operand);
-  }
-  HloInstruction* new_reduce_window = reduce_window->parent()->AddInstruction(
-      HloInstruction::CreateReduceWindow(
-          reduce_window->shape().IsTuple()
-              ? ShapeUtil::MakeTupleShape(r2_output_shapes)
-              : r2_output_shapes[0],
-          r2_operands, reduce_window->init_values(), r2_window,
-          reduce_window->to_apply()));
-
-  VLOG(2) << "R2 resulting reduce window: " << new_reduce_window->ToString();
-
-  std::vector<HloInstruction*> final_reshapes;
-  ShapeUtil::ForEachSubshape(
-      reduce_window->shape(),
-      [&](const Shape& subshape, const ShapeIndex& shape_index) {
-        if (!ShapeUtil::IsLeafIndex(reduce_window->shape(), shape_index)) {
-          return;
-        }
-        HloInstruction* final_reshape =
-            new_reduce_window->parent()->AddInstruction(
-                HloInstruction::CreateReshape(
-                    subshape, GetAtIndex(new_reduce_window, shape_index)));
-        final_reshapes.push_back(final_reshape);
-      });
-  HloInstruction* result;
-  if (reduce_window->shape().IsTuple()) {
-    result = new_reduce_window->parent()->AddInstruction(
-        HloInstruction::CreateTuple(final_reshapes));
-  } else {
-    CHECK_EQ(final_reshapes.size(), 1);
-    result = final_reshapes[0];
-  }
-  TF_RETURN_IF_ERROR(reduce_window->ReplaceAllUsesWith(result));
-  TF_RETURN_IF_ERROR(
-      new_reduce_window->parent()->RemoveInstruction(reduce_window));
-
-  return absl::OkStatus();
 }
 
 std::vector<int64_t> ReduceWindowRewriter::GetTransposedInputs(
@@ -176,12 +225,10 @@ std::vector<int64_t> ReduceWindowRewriter::GetTransposedInputs(
 }
 
 int64_t ReduceWindowRewriter::PreparePaddingForRewrite(
-    HloReduceWindowInstruction* reduce_window,
+    HloComputation* hlo_computation,
+    absl::Span<HloInstruction* const> init_values,
     std::vector<HloInstruction*>& inputs, int64_t scan_length,
     int64_t last_dim) {
-  HloComputation* hlo_computation = reduce_window->parent();
-  absl::Span<HloInstruction* const> init_values = reduce_window->init_values();
-
   Shape shape = inputs.front()->shape();
   int64_t rank = shape.dimensions().size();
 
@@ -234,12 +281,10 @@ int64_t ReduceWindowRewriter::ExpandToNewMajorDimension(
 
 // reduce_window ( [x, y/base, base] window [1, 1, base] )
 HloInstruction* ReduceWindowRewriter::GenerateNewReduceWindowWithTiledInputs(
-    HloReduceWindowInstruction* reduce_window,
-    std::vector<HloInstruction*>& tiled_inputs,
-    std::vector<Shape>& tiled_shapes, bool forward_scan) {
-  const int64_t rank =
-      reduce_window->inputs().front()->shape().dimensions().size();
-  HloComputation* hlo_computation = reduce_window->parent();
+    HloComputation* hlo_computation, std::vector<HloInstruction*>& tiled_inputs,
+    absl::Span<HloInstruction* const> init_values, HloComputation* to_apply,
+    std::vector<Shape>& tiled_shapes, bool forward_scan, bool is_tuple_result) {
+  const int64_t rank = tiled_inputs.front()->shape().dimensions().size() - 1;
 
   Window outer_window =
       window_util::MakeWindow(std::vector<int64_t>(rank + 1, 1));
@@ -252,10 +297,9 @@ HloInstruction* ReduceWindowRewriter::GenerateNewReduceWindowWithTiledInputs(
   }
 
   return hlo_computation->AddInstruction(HloInstruction::CreateReduceWindow(
-      reduce_window->shape().IsTuple() ? ShapeUtil::MakeTupleShape(tiled_shapes)
-                                       : tiled_shapes[0],
-      tiled_inputs, reduce_window->init_values(), outer_window,
-      reduce_window->to_apply()));
+      is_tuple_result ? ShapeUtil::MakeTupleShape(tiled_shapes)
+                      : tiled_shapes[0],
+      tiled_inputs, init_values, outer_window, to_apply));
 }
 
 // slices [x, y/base, base] -> [x, y/base, 1] slice {x, y/base}
@@ -293,6 +337,253 @@ void ReduceWindowRewriter::SliceOutLastColumn(
   column_shapes.push_back(column_shape);
 }
 
+absl::StatusOr<HloInstruction*>
+ReduceWindowRewriter::RewriteScanAsTreeReduction(
+    HloComputation* parent, std::vector<HloInstruction*> sources,
+    absl::Span<HloInstruction* const> init_values, HloComputation* to_apply,
+    const Shape& result_shape, int64_t rank, int64_t scan_dim,
+    int64_t scan_length, bool forward_scan, bool is_exclusive) {
+  const int64_t last_dim = rank - 1;
+
+  // Since we need to tile the scan dimension, it's convenient to have it
+  // logically last. If the scan dimension is not the last dimension, we need to
+  // transpose the inputs by permuting the dimensions.
+  std::vector<int64_t> permutation =
+      GetTransposedInputs(parent, sources, rank, scan_dim, last_dim);
+
+  // Break the scan into an "inner" and an "outer" scan - this is basically a
+  // tree reduction:
+  // (The explanation below assumes an R1 scan for simplicity. For Rk scan, all
+  // shapes have k-1 "batch" dimensions that need to be preserved.)
+  //
+  // 1) If necessary, pad input from {N} to {K}, where K is a multiple of 128.
+  // 2) Reshape from {K} to {K / base, base}.
+  // 3) Scan each base dimension.
+  // 4) Slice out the last column.
+  // 5) Exclusive scan across the last column.
+  // 6) Broadcast it back into {K / base, base}
+  // 7) Add up the results of (3) and (6).
+  // 8) Reshape back into {K}
+  // 9) Slice off the padding.
+  // For reverse scans, we perform the same as forward scans, except: we perform
+  // a reverse scan at (3), slice out the first column at (4), and perform an
+  // exclusive reverse scan of the first column at (5).
+
+  // For example, consider a cumulative sum over an R1 of length 9, with a base
+  // case of 3 instead of 128. Let the input be: [0 1 2 3 4 5 6 7 8]
+
+  // 1) If necessary, pad input from {N} to {K}, where K is a multiple of 128.
+  const int64_t padded_length = PreparePaddingForRewrite(
+      parent, init_values, sources, scan_length, last_dim);
+
+  // 2) Reshape to R(k+1).
+  // [x, y] -> [x, y/base, base]
+  // In the example above
+  // [0 1 2 3 4 5 6 7 8] -> [0 1 2
+  //                         3 4 5
+  //                         6 7 8]
+  std::vector<HloInstruction*> tiled_sources;
+  std::vector<Shape> tiled_shapes;
+  const int64_t num_columns = ExpandToNewMajorDimension(
+      parent, sources, tiled_sources, tiled_shapes, padded_length, last_dim);
+
+  // 3) Outer scan - Scan each "base" dimension.
+  // reduce_window ( [x, y/base, base] window [1, 1, base] )
+  // scan for each window of {1, base}
+  // [0 1 2     [0  1  3
+  //  3 4 5  ->  3  7 12
+  //  6 7 8]     6 13 21]
+  HloInstruction* outer_reduce_window = GenerateNewReduceWindowWithTiledInputs(
+      parent, tiled_sources, init_values, to_apply, tiled_shapes, forward_scan,
+      result_shape.IsTuple());
+
+  // 4) Slice out the last column.
+  // Slice out the last (first if reverse scan) column.
+  // [0  1  3     [ 3
+  //  3  7 12  ->  12
+  //  6 13 21]     21]
+  std::vector<Shape> column_shapes;
+  std::vector<HloInstruction*> last_cols;
+  ShapeUtil::ForEachSubshape(
+      outer_reduce_window->shape(),
+      [&](const Shape& subshape, const ShapeIndex& shape_index) {
+        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
+                                    shape_index)) {
+          return;
+        }
+
+        // slices [x, y/base, base] -> [x, y/base, 1] slice {x, y/base}
+        // reshape [x, y/base, 1] -> [x, y/base]
+        SliceOutLastColumn(
+            parent, subshape,
+            /*outer_shape=*/
+            reduce_window_util::GetAtIndex(outer_reduce_window, shape_index),
+            rank, last_dim, forward_scan, num_columns, column_shapes,
+            last_cols);
+      });
+
+  // 5) Inner scan - Exclusive scan for the last column.
+  //  [ 3       [ 0
+  //   12   ->    3
+  //   21]       15]
+  Window inner_window = window_util::MakeWindow(std::vector<int64_t>(rank, 1));
+  inner_window.mutable_dimensions(last_dim)->set_size(num_columns);
+  if (forward_scan) {
+    inner_window.mutable_dimensions(last_dim)->set_padding_low(num_columns);
+  } else {
+    inner_window.mutable_dimensions(last_dim)->set_padding_high(num_columns);
+  }
+  auto inner_reduce_window =
+      parent->AddInstruction(HloInstruction::CreateReduceWindow(
+          result_shape.IsTuple() ? ShapeUtil::MakeTupleShape(column_shapes)
+                                 : column_shapes[0],
+          last_cols, init_values, inner_window, to_apply));
+  std::vector<int64_t> exclusive_slice_starts(rank, 0);
+  std::vector<int64_t> exclusive_slice_limits =
+      SpanToVector(column_shapes[0].dimensions());
+  if (forward_scan) {
+    exclusive_slice_limits[last_dim] = num_columns;
+  } else {
+    exclusive_slice_starts[last_dim] = 1;
+    exclusive_slice_limits[last_dim] = num_columns + 1;
+  }
+
+  // 6) Broadcast it back into {K / 128, 128}
+  // [ 0      [ 0  0  0
+  //   3  ->    3  3  3
+  //  15]      15 15 15]
+  std::vector<HloInstruction*> inner_scan_components;
+  ShapeUtil::ForEachSubshape(
+      inner_reduce_window->shape(),
+      [&](const Shape& subshape, const ShapeIndex& shape_index) {
+        if (!ShapeUtil::IsLeafIndex(inner_reduce_window->shape(),
+                                    shape_index)) {
+          return;
+        }
+        size_t idx = FlattenShapeIndex(shape_index);
+        auto last_col = last_cols[idx];
+        auto* inner_slice = parent->AddInstruction(HloInstruction::CreateSlice(
+            last_col->shape(),
+            reduce_window_util::GetAtIndex(inner_reduce_window, shape_index),
+            exclusive_slice_starts, exclusive_slice_limits,
+            std::vector<int64_t>(rank, 1)));
+
+        std::vector<int64_t> rank_iota(rank);
+        absl::c_iota(rank_iota, 0);
+        auto* inner_scan_component =
+            parent->AddInstruction(HloInstruction::CreateBroadcast(
+                tiled_shapes[idx], inner_slice, rank_iota));
+        inner_scan_components.push_back(inner_scan_component);
+      });
+
+  // Combine inner and outer scans.
+  std::vector<HloInstruction*> map_operands;
+  ShapeUtil::ForEachSubshape(
+      outer_reduce_window->shape(),
+      [&](const Shape& subshape, const ShapeIndex& shape_index) {
+        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
+                                    shape_index)) {
+          return;
+        }
+        map_operands.push_back(
+            reduce_window_util::GetAtIndex(outer_reduce_window, shape_index));
+      });
+  map_operands.insert(map_operands.end(), inner_scan_components.begin(),
+                      inner_scan_components.end());
+
+  // Finally, we add up the two scans (3) and (6), getting (7):
+  // [ 0  1  3
+  //   6 10 15
+  //  21 28 36]
+  //
+  // And reshape back into [0 1 3 6 10 15 21 28 36].
+  std::vector<HloInstruction*> scans;
+
+  // Reshape back to Rk and slice out the padding.
+  auto status = ShapeUtil::ForEachSubshapeWithStatus(
+      outer_reduce_window->shape(),
+      [&](const Shape& subshape,
+          const ShapeIndex& shape_index) -> absl::Status {
+        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
+                                    shape_index)) {
+          return absl::OkStatus();
+        }
+        size_t idx = FlattenShapeIndex(shape_index);
+        auto source = sources[idx];
+        HloComputation* map_computation;
+        auto reduce_function_root = to_apply->root_instruction();
+        if (reduce_function_root->shape().IsTuple()) {
+          // This corresponds to step 7: combining the inner scan with the outer
+          // scan using a map function.
+          // We add (apply map function) up the two scans (3) and (6), getting
+          // (7):
+          //      ( [0  1  3    [ 0  0  0  )     [ 0  1  3
+          // map  (  3  7 12      3  3  3  )  ->   6 10 15
+          // (+)  (  6 13 21]    15 15 15] )      21 28 36]
+          auto* map_computation_root = reduce_function_root->operand(idx);
+          absl::flat_hash_map<const HloInstruction*,
+                              std::unique_ptr<HloInstruction>>
+              replacements;
+          replacements[reduce_function_root] = nullptr;
+          map_computation = parent->parent()->AddEmbeddedComputation(
+              to_apply->CloneWithReplacements(&replacements,
+                                              /*extra_parameters=*/{}, nullptr,
+                                              "clone", map_computation_root));
+        } else {
+          map_computation = to_apply;
+        }
+        auto scan = parent->AddInstruction(HloInstruction::CreateMap(
+            reduce_window_util::ShapeAtIndex(outer_reduce_window->shape(),
+                                             shape_index),
+            map_operands, map_computation));
+        scan = parent->AddInstruction(
+            HloInstruction::CreateReshape(source->shape(), scan));
+
+        // If necessary, transpose back to the original order.
+        if (scan_dim != last_dim) {
+          scan = parent->AddInstruction(HloInstruction::CreateTranspose(
+              ShapeUtil::PermuteDimensions(permutation, source->shape()), scan,
+              permutation));
+        }
+
+        // Remove the padding to the base length.
+        if (padded_length != scan_length) {
+          Shape slice_shape =
+              reduce_window_util::ShapeAtIndex(result_shape, shape_index);
+          slice_shape.set_dimensions(scan_dim, scan_length);
+          scan = parent->AddInstruction(HloInstruction::CreateSlice(
+              slice_shape, scan, std::vector<int64_t>(rank, 0),
+              slice_shape.dimensions(), std::vector<int64_t>(rank, 1)));
+        }
+
+        if (is_exclusive) {
+          auto padding_config = MakeNoPaddingConfig(rank);
+          if (forward_scan) {
+            padding_config.mutable_dimensions(scan_dim)->set_edge_padding_low(
+                1);
+          } else {
+            padding_config.mutable_dimensions(scan_dim)->set_edge_padding_high(
+                1);
+          }
+          scan = parent->AddInstruction(HloInstruction::CreatePad(
+              reduce_window_util::ShapeAtIndex(result_shape, shape_index), scan,
+              init_values[idx], padding_config));
+        }
+        scans.push_back(scan);
+        return absl::OkStatus();
+      });
+  RETURN_IF_ERROR(status);
+
+  HloInstruction* scan;
+  if (result_shape.IsTuple()) {
+    scan = parent->AddInstruction(HloInstruction::CreateTuple(scans));
+  } else {
+    CHECK_EQ(scans.size(), 1);
+    scan = scans[0];
+  }
+  return scan;
+}
+
 absl::StatusOr<bool> ReduceWindowRewriter::TryOptimizeCumSumOrProd(
     HloReduceWindowInstruction* reduce_window) {
   const Shape& operand_shape = reduce_window->inputs().front()->shape();
@@ -300,7 +591,6 @@ absl::StatusOr<bool> ReduceWindowRewriter::TryOptimizeCumSumOrProd(
   // Try to find the scan axis. We expect all window dimensions to be trivial,
   // except for one.
   const int64_t rank = operand_shape.dimensions().size();
-  const int64_t last_dim = rank - 1;
   const Window& window = reduce_window->window();
   std::vector<int64_t> non_trivial_window_dimensions =
       reduce_window->non_trivial_window_dimensions();
@@ -350,272 +640,110 @@ absl::StatusOr<bool> ReduceWindowRewriter::TryOptimizeCumSumOrProd(
   std::vector<HloInstruction*> sources(reduce_window->inputs().begin(),
                                        reduce_window->inputs().end());
 
-  // Since we need to tile the scan dimension, it's convenient to have it
-  // logically last. If the scan dimension is not the last dimension, we need to
-  // transpose the inputs by permuting the dimensions.
-  std::vector<int64_t> permutation =
-      GetTransposedInputs(parent, sources, rank, scan_dim, last_dim);
-
   // We don't actually need to match the computation - this transformation will
-  // work for an commutative/associative reducer, which is what we assume for
+  // work for a commutative/associative reducer, which is what we assume for
   // ReduceWindow anyway.
+  ASSIGN_OR_RETURN(HloInstruction * scan,
+                   RewriteScanAsTreeReduction(
+                       parent, sources, reduce_window->init_values(),
+                       reduce_window->to_apply(), reduce_window->shape(), rank,
+                       scan_dim, scan_length, forward_scan, is_exclusive));
+  RETURN_IF_ERROR(reduce_window->ReplaceAllUsesWith(scan));
+  RETURN_IF_ERROR(parent->RemoveInstruction(reduce_window));
+  return true;
+}
 
-  // Break the scan into an "inner" and an "outer" scan - this is basically a
-  // tree reduction:
-  // (The explanation below assumes an R1 scan for simplicity. For Rk scan, all
-  // shapes have k-1 "batch" dimensions that need to be preserved.)
-  //
-  // 1) If necessary, pad input from {N} to {K}, where K is a multiple of 128.
-  // 2) Reshape from {K} to {K / base, base}.
-  // 3) Scan each base dimension.
-  // 4) Slice out the last column.
-  // 5) Exclusive scan across the last column.
-  // 6) Broadcast it back into {K / base, base}
-  // 7) Add up the results of (3) and (6).
-  // 8) Reshape back into {K}
-  // 9) Slice off the padding.
-  // For reverse scans, we perform the same as forward scans, except: we perform
-  // a reverse scan at (3), slice out the first column at (4), and perform an
-  // exclusive reverse scan of the first column at (5).
-
-  // For example, consider a cumulative sum over an R1 of length 9, with a base
-  // case of 3 instead of 128. Let the input be: [0 1 2 3 4 5 6 7 8]
-
-  // 1) If necessary, pad input from {N} to {K}, where K is a multiple of 128.
-  const int64_t padded_length =
-      PreparePaddingForRewrite(reduce_window, sources, scan_length, last_dim);
-
-  // 2) Reshape to R(k+1).
-  // [x, y] -> [x, y/base, base]
-  // In the example above
-  // [0 1 2 3 4 5 6 7 8] -> [0 1 2
-  //                         3 4 5
-  //                         6 7 8]
-  std::vector<HloInstruction*> tiled_sources;
-  std::vector<Shape> tiled_shapes;
-  const int64_t num_columns = ExpandToNewMajorDimension(
-      parent, sources, tiled_sources, tiled_shapes, padded_length, last_dim);
-
-  // 3) Outer scan - Scan each "base" dimension.
-  // reduce_window ( [x, y/base, base] window [1, 1, base] )
-  // scan for each window of {1, base}
-  // [0 1 2     [0  1  3
-  //  3 4 5  ->  3  7 12
-  //  6 7 8]     6 13 21]
-  HloInstruction* outer_reduce_window = GenerateNewReduceWindowWithTiledInputs(
-      reduce_window, tiled_sources, tiled_shapes, forward_scan);
-
-  // 4) Slice out the last column.
-  // Slice out the last (first if reverse scan) column.
-  // [0  1  3     [ 3
-  //  3  7 12  ->  12
-  //  6 13 21]     21]
-  std::vector<Shape> column_shapes;
-  std::vector<HloInstruction*> last_cols;
-  ShapeUtil::ForEachSubshape(
-      outer_reduce_window->shape(),
-      [&](const Shape& subshape, const ShapeIndex& shape_index) {
-        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
-                                    shape_index)) {
-          return;
-        }
-
-        // slices [x, y/base, base] -> [x, y/base, 1] slice {x, y/base}
-        // reshape [x, y/base, 1] -> [x, y/base]
-        SliceOutLastColumn(
-            parent, subshape,
-            /*outer_shape=*/GetAtIndex(outer_reduce_window, shape_index), rank,
-            last_dim, forward_scan, num_columns, column_shapes, last_cols);
-      });
-
-  // 5) Inner scan - Exclusive scan for the last column.
-  //  [ 3       [ 0
-  //   12   ->    3
-  //   21]       15]
-  absl::Span<HloInstruction* const> init_values = reduce_window->init_values();
-  Window inner_window = window_util::MakeWindow(std::vector<int64_t>(rank, 1));
-  inner_window.mutable_dimensions(last_dim)->set_size(num_columns);
-  if (forward_scan) {
-    inner_window.mutable_dimensions(last_dim)->set_padding_low(num_columns);
-  } else {
-    inner_window.mutable_dimensions(last_dim)->set_padding_high(num_columns);
-  }
-  auto inner_reduce_window =
-      parent->AddInstruction(HloInstruction::CreateReduceWindow(
-          reduce_window->shape().IsTuple()
-              ? ShapeUtil::MakeTupleShape(column_shapes)
-              : column_shapes[0],
-          last_cols, init_values, inner_window, reduce_window->to_apply()));
-  std::vector<int64_t> exclusive_slice_starts(rank, 0);
-  std::vector<int64_t> exclusive_slice_limits =
-      SpanToVector(column_shapes[0].dimensions());
-  if (forward_scan) {
-    exclusive_slice_limits[last_dim] = num_columns;
-  } else {
-    exclusive_slice_starts[last_dim] = 1;
-    exclusive_slice_limits[last_dim] = num_columns + 1;
+absl::StatusOr<bool> ReduceWindowRewriter::TryOptimizeAssociativeScan(
+    HloScanInstruction* scan) {
+  if (!hlo_query::IsStandardAssociativeScan(scan)) {
+    return false;
   }
 
-  // 6) Broadcast it back into {K / 128, 128}
-  // [ 0      [ 0  0  0
-  //   3  ->    3  3  3
-  //  15]      15 15 15]
-  std::vector<HloInstruction*> inner_scan_components;
-  ShapeUtil::ForEachSubshape(
-      inner_reduce_window->shape(),
-      [&](const Shape& subshape, const ShapeIndex& shape_index) {
-        if (!ShapeUtil::IsLeafIndex(inner_reduce_window->shape(),
-                                    shape_index)) {
-          return;
-        }
-        size_t idx = FlattenShapeIndex(shape_index);
-        auto last_col = last_cols[idx];
-        auto* inner_slice = parent->AddInstruction(HloInstruction::CreateSlice(
-            last_col->shape(), GetAtIndex(inner_reduce_window, shape_index),
-            exclusive_slice_starts, exclusive_slice_limits,
-            std::vector<int64_t>(rank, 1)));
+  const Shape& operand_shape = scan->inputs()[0]->shape();
+  int64_t rank = operand_shape.dimensions().size();
+  int64_t scan_dim = scan->scan_dimension();
+  int64_t scan_length = operand_shape.dimensions(scan_dim);
 
-        std::vector<int64_t> rank_iota(rank);
-        absl::c_iota(rank_iota, 0);
-        auto* inner_scan_component =
-            parent->AddInstruction(HloInstruction::CreateBroadcast(
-                tiled_shapes[idx], inner_slice, rank_iota));
-        inner_scan_components.push_back(inner_scan_component);
-      });
+  VLOG(2) << "Rewriting associative scan: " << scan->ToString();
+  HloComputation* parent = scan->parent();
 
-  // Combine inner and outer scans.
-  std::vector<HloInstruction*> map_operands;
-  ShapeUtil::ForEachSubshape(
-      outer_reduce_window->shape(),
-      [&](const Shape& subshape, const ShapeIndex& shape_index) {
-        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
-                                    shape_index)) {
-          return;
-        }
-        map_operands.push_back(GetAtIndex(outer_reduce_window, shape_index));
-      });
-  map_operands.insert(map_operands.end(), inner_scan_components.begin(),
-                      inner_scan_components.end());
+  ASSIGN_OR_RETURN(HloInstruction * init,
+                   GetScalarInitValue(scan->inits()[0], parent));
+  ASSIGN_OR_RETURN(HloComputation * scan_to_apply,
+                   ScalarizeComputation(scan->to_apply(), parent));
+  HloComputation::Builder builder(
+      absl::StrCat(scan_to_apply->name(), "_rw_wrapper"));
 
-  // Finally, we add up the two scans (3) and (6), getting (7):
-  // [ 0  1  3
-  //   6 10 15
-  //  21 28 36]
-  //
-  // And reshape back into [0 1 3 6 10 15 21 28 36].
-  std::vector<HloInstruction*> scans;
+  HloInstruction* carry_param =
+      builder.AddInstruction(HloInstruction::CreateParameter(
+          0, scan_to_apply->parameter_instruction(1)->shape(), "carry_0"));
+  HloInstruction* input_param =
+      builder.AddInstruction(HloInstruction::CreateParameter(
+          1, scan_to_apply->parameter_instruction(0)->shape(), "input_0"));
+  HloInstruction* call = builder.AddInstruction(
+      HloInstruction::CreateCall(scan_to_apply->root_instruction()->shape(),
+                                 {input_param, carry_param}, scan_to_apply));
+  builder.AddInstruction(HloInstruction::CreateGetTupleElement(call, 1));
+  HloComputation* rw_to_apply =
+      parent->parent()->AddEmbeddedComputation(builder.Build());
 
-  // Reshape back to Rk and slice out the padding.
-  auto status = ShapeUtil::ForEachSubshapeWithStatus(
-      outer_reduce_window->shape(),
-      [&](const Shape& subshape,
-          const ShapeIndex& shape_index) -> absl::Status {
-        if (!ShapeUtil::IsLeafIndex(outer_reduce_window->shape(),
-                                    shape_index)) {
-          return absl::OkStatus();
-        }
-        size_t idx = FlattenShapeIndex(shape_index);
-        auto source = sources[idx];
-        HloComputation* map_computation;
-        auto reduce_function_root =
-            reduce_window->to_apply()->root_instruction();
-        if (reduce_function_root->shape().IsTuple()) {
-          // This corresponds to step 7: combining the inner scan with the outer
-          // scan using a map function.
-          // We add (apply map function) up the two scans (3) and (6), getting
-          // (7):
-          //      ( [0  1  3    [ 0  0  0  )     [ 0  1  3
-          // map  (  3  7 12      3  3  3  )  ->   6 10 15
-          // (+)  (  6 13 21]    15 15 15] )      21 28 36]
-          auto* map_computation_root = reduce_function_root->operand(idx);
-          absl::flat_hash_map<const HloInstruction*,
-                              std::unique_ptr<HloInstruction>>
-              replacements;
-          replacements[reduce_function_root] = nullptr;
-          map_computation = parent->parent()->AddEmbeddedComputation(
-              reduce_window->to_apply()->CloneWithReplacements(
-                  &replacements,
-                  /*extra_parameters=*/{}, nullptr, "clone",
-                  map_computation_root));
-        } else {
-          map_computation = reduce_window->to_apply();
-        }
-        auto scan = parent->AddInstruction(HloInstruction::CreateMap(
-            ShapeAtIndex(outer_reduce_window->shape(), shape_index),
-            map_operands, map_computation));
-        scan = parent->AddInstruction(
-            HloInstruction::CreateReshape(source->shape(), scan));
+  HloInstruction* result = nullptr;
+  HloInstruction* input = scan->inputs()[0];
+  if (scan_length <= base_length_) {
+    Window window = window_util::MakeWindow(std::vector<int64_t>(rank, 1));
+    window.mutable_dimensions(scan_dim)->set_size(scan_length);
+    window.mutable_dimensions(scan_dim)->set_padding_low(scan_length - 1);
 
-        // If necessary, transpose back to the original order.
-        if (scan_dim != last_dim) {
-          scan = parent->AddInstruction(HloInstruction::CreateTranspose(
-              ShapeUtil::PermuteDimensions(permutation, source->shape()), scan,
-              permutation));
-        }
-
-        // Remove the padding to the base length.
-        if (padded_length != scan_length) {
-          scan = parent->AddInstruction(HloInstruction::CreateSlice(
-              operand_shape, scan, std::vector<int64_t>(rank, 0),
-              operand_shape.dimensions(), std::vector<int64_t>(rank, 1)));
-        }
-
-        if (is_exclusive) {
-          auto padding_config = MakeNoPaddingConfig(rank);
-          if (forward_scan) {
-            padding_config.mutable_dimensions(scan_dim)->set_edge_padding_low(
-                1);
-          } else {
-            padding_config.mutable_dimensions(scan_dim)->set_edge_padding_high(
-                1);
-          }
-          scan = parent->AddInstruction(HloInstruction::CreatePad(
-              ShapeAtIndex(reduce_window->shape(), shape_index), scan,
-              init_values[idx], padding_config));
-        }
-        scans.push_back(scan);
-        return absl::OkStatus();
-      });
-  TF_RETURN_IF_ERROR(status);
-
-  HloInstruction* scan;
-  if (reduce_window->shape().IsTuple()) {
-    scan = parent->AddInstruction(HloInstruction::CreateTuple(scans));
+    result = parent->AddInstruction(HloInstruction::CreateReduceWindow(
+        input->shape(), input, init, window, rw_to_apply));
   } else {
-    CHECK_EQ(scans.size(), 1);
-    scan = scans[0];
+    Shape outputs_shape = scan->shape().tuple_shapes(0);
+    ASSIGN_OR_RETURN(result, RewriteScanAsTreeReduction(
+                                 parent, {input}, {init}, rw_to_apply,
+                                 outputs_shape, rank, scan_dim, scan_length,
+                                 /*forward_scan=*/true,
+                                 /*is_exclusive=*/false));
   }
-  TF_RETURN_IF_ERROR(reduce_window->ReplaceAllUsesWith(scan));
-  TF_RETURN_IF_ERROR(parent->RemoveInstruction(reduce_window));
+
+  // Replace carry with init value, users are guaranteed to be dead.
+  HloInstruction* tuple = parent->AddInstruction(
+      HloInstruction::CreateTuple({result, scan->inits()[0]}));
+  RETURN_IF_ERROR(parent->ReplaceInstruction(scan, tuple));
 
   return true;
 }
 
-absl::StatusOr<bool> ReduceWindowRewriter::Run(
+absl::StatusOr<bool> ReduceWindowRewriter::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   bool changed = false;
+  const bool decompose_assoc_scan = DecomposeAssociativeScan();
   for (const auto& computation : module->computations(execution_threads)) {
     for (HloInstruction* instruction :
          computation->MakeInstructionPostOrder()) {
-      HloReduceWindowInstruction* reduce_window =
-          DynCast<HloReduceWindowInstruction>(instruction);
-      if (!reduce_window) {
-        continue;
-      }
-      TF_ASSIGN_OR_RETURN(bool made_change,
-                          TryOptimizeCumSumOrProd(reduce_window));
-      if (made_change) {
-        changed = true;
+      if (auto* scan = DynCast<HloScanInstruction>(instruction)) {
+        if (decompose_assoc_scan) {
+          ASSIGN_OR_RETURN(bool result, TryOptimizeAssociativeScan(scan));
+          changed |= result;
+        }
         continue;
       }
 
-      if (reduce_window->inputs().front()->shape().dimensions().size() != 1) {
+      if (auto* reduce_window =
+              DynCast<HloReduceWindowInstruction>(instruction)) {
+        auto result = TryOptimizeCumSumOrProd(reduce_window);
+        RETURN_IF_ERROR(result.status());
+        if (*result) {
+          changed = true;
+          continue;
+        }
+        if (reduce_window->inputs().front()->shape().dimensions().size() == 1) {
+          RETURN_IF_ERROR(reduce_window_util::Replace1DReduceWindowWithReshape(
+              reduce_window));
+          changed = true;
+        }
         continue;
       }
-      TF_RETURN_IF_ERROR(ReplaceReduceWindowWithReshape(reduce_window));
-
-      changed = true;
     }
   }
   return changed;

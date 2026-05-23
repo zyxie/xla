@@ -25,8 +25,10 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/lazy.h"
@@ -35,7 +37,6 @@ limitations under the License.
 #include "xla/shape_tree.h"
 #include "xla/shape_util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/logging.h"
 
 namespace xla {
 
@@ -153,7 +154,7 @@ class HloValue : public BufferValue {
   // Return the shape of this HloValue.
   const Shape& shape() const override { return defining_position().shape(); }
 
-  using Positions = absl::InlinedVector<HloPosition, 3>;
+  using Positions = absl::InlinedVector<HloPosition, 2>;
   // Return all positions of the HloValue in the module.
   const Positions& positions() const { return positions_; }
 
@@ -181,7 +182,7 @@ class HloValue : public BufferValue {
   std::string ToString() const override { return ToString(0); }
 
  private:
-  using Uses = absl::InlinedVector<HloUse, 3>;
+  using Uses = absl::InlinedVector<HloUse, 2>;
   // Called when lazily computing the uses.
   Uses ComputeUses() const;
 
@@ -191,13 +192,13 @@ class HloValue : public BufferValue {
 
   // The set of uses of this HloValue. This is lazily constructed until getting
   // accessed.
-  Lazy<Uses> uses_;
+  ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS Lazy<Uses> uses_;
 
   // Whether this instruction is a phi value.
-  const bool is_phi_;
+  bool is_phi_ : 1;
 
   // Whether this value is live out of the HLO module.
-  bool live_out_of_module_ = false;
+  bool live_out_of_module_ : 1;
 };
 
 std::ostream& operator<<(std::ostream& out, const HloValue& hlo_value);
@@ -242,7 +243,9 @@ class HloValueSet {
   }
 
   bool operator==(const HloValueSet& other) const {
-    if (values_.size() != other.values_.size()) return false;
+    if (values_.size() != other.values_.size()) {
+      return false;
+    }
     for (size_t i = 0; i < values_.size(); ++i) {
       if (values_[i]->id() != other.values_[i]->id()) {
         return false;

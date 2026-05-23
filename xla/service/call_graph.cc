@@ -18,69 +18,33 @@ limitations under the License.
 #include <deque>
 #include <memory>
 #include <queue>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/map_util.h"
+#include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
-#include "tsl/platform/errors.h"
 
 namespace xla {
 
 using absl::StrAppendFormat;
 using absl::StrCat;
-
-std::string CallContextToString(CallContext context) {
-  switch (context) {
-    case CallContext::kNone:
-      return "kNone";
-    case CallContext::kControlFlow:
-      return "kControlFlow";
-    case CallContext::kEmbedded:
-      return "kEmbedded";
-    case CallContext::kBoth:
-      return "kBoth";
-  }
-}
-
-std::ostream& operator<<(std::ostream& out, const CallContext& context) {
-  out << CallContextToString(context);
-  return out;
-}
-
-CallContext GetInstructionCallContext(HloOpcode opcode) {
-  switch (opcode) {
-    case HloOpcode::kCall:
-    case HloOpcode::kConditional:
-    case HloOpcode::kWhile:
-    case HloOpcode::kAsyncStart:
-    case HloOpcode::kAsyncUpdate:
-    case HloOpcode::kAsyncDone:
-      return CallContext::kControlFlow;
-    case HloOpcode::kAllReduce:
-    case HloOpcode::kReduceScatter:
-    case HloOpcode::kAllReduceStart:
-    case HloOpcode::kMap:
-    case HloOpcode::kReduce:
-    case HloOpcode::kReduceWindow:
-    case HloOpcode::kScatter:
-    case HloOpcode::kSelectAndScatter:
-    case HloOpcode::kSort:
-    case HloOpcode::kFusion:
-    case HloOpcode::kCustomCall:
-      return CallContext::kEmbedded;
-    default:
-      return CallContext::kNone;
-  }
-}
 
 std::string CallSite::ToString() const {
   return StrCat(
@@ -373,7 +337,7 @@ absl::Status CallGraph::VisitNodesInternal(
   }
 
   for (const HloComputation* computation : node.callees()) {
-    TF_RETURN_IF_ERROR(
+    RETURN_IF_ERROR(
         VisitNodesInternal(visitor_func, GetNode(computation), visited));
   }
 
@@ -391,13 +355,13 @@ absl::StatusOr<bool> CallGraph::VisitNodesInternal(
 
   bool changed = false;
   for (const HloComputation* computation : node.callees()) {
-    TF_ASSIGN_OR_RETURN(
+    ASSIGN_OR_RETURN(
         bool node_changed,
         VisitNodesInternal(visitor_func, GetNode(computation), visited));
     changed |= node_changed;
   }
 
-  TF_ASSIGN_OR_RETURN(bool node_changed, visitor_func(node));
+  ASSIGN_OR_RETURN(bool node_changed, visitor_func(node));
   changed |= node_changed;
   return changed;
 }
@@ -409,12 +373,12 @@ absl::Status CallGraph::VisitNodes(VisitorFunction visitor_func,
     // Traverse from all roots in the call graph.
     for (const CallGraphNode& node : nodes()) {
       if (node.callers().empty()) {
-        TF_RETURN_IF_ERROR(VisitNodesInternal(visitor_func, node, &visited));
+        RETURN_IF_ERROR(VisitNodesInternal(visitor_func, node, &visited));
       }
     }
   } else {
     // Traverse only from the entry computation.
-    TF_RETURN_IF_ERROR(VisitNodesInternal(
+    RETURN_IF_ERROR(VisitNodesInternal(
         visitor_func, GetNode(module_->entry_computation()), &visited));
   }
 
@@ -429,14 +393,14 @@ absl::StatusOr<bool> CallGraph::VisitNodesWithReturn(
     // Traverse from all roots in the call graph.
     for (const CallGraphNode& node : nodes()) {
       if (node.callers().empty()) {
-        TF_ASSIGN_OR_RETURN(bool node_changed,
-                            VisitNodesInternal(visitor_func, node, &visited));
+        ASSIGN_OR_RETURN(bool node_changed,
+                         VisitNodesInternal(visitor_func, node, &visited));
         changed |= node_changed;
       }
     }
   } else {
     // Traverse only from the entry computation.
-    TF_ASSIGN_OR_RETURN(
+    ASSIGN_OR_RETURN(
         changed,
         VisitNodesInternal(visitor_func, GetNode(module_->entry_computation()),
                            &visited));
@@ -631,8 +595,7 @@ absl::flat_hash_set<const T*> CallGraph::NearestCommonAncestorsHelper(
         return nearest_common_ancestors.contains(nca);
       })) {
     absl::erase_if(nearest_common_ancestors, [&starting_nodes](const T* nca) {
-      return std::find(starting_nodes.begin(), starting_nodes.end(), nca) ==
-             starting_nodes.end();
+      return absl::c_find(starting_nodes, nca) == starting_nodes.end();
     });
   }
 

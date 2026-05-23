@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/layout_util.h"
@@ -34,20 +35,19 @@ limitations under the License.
 #include "xla/python/ifrt/shape.h"
 #include "xla/python/ifrt/sharding.h"
 #include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
+using ::testing::_;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 using ::testing::Optional;
 using ::testing::Return;
 using ::testing::ReturnRef;
-using ::tsl::testing::IsOkAndHolds;
-using ::tsl::testing::StatusIs;
 
 TEST(CompactLayoutTest, Create) {
   {
@@ -106,10 +106,82 @@ TEST(CompactLayoutTest, ByteSize) {
     TF_ASSERT_OK_AND_ASSIGN(auto layout, CompactLayout::Create({}));
     EXPECT_THAT(
         layout->ByteSize(DType(DType::kS32), Shape({3, 2})),
-        StatusIs(tsl::error::INVALID_ARGUMENT,
-                 HasSubstr(
-                     "CompactLayout expects Shape with the same number of "
-                     "dimensions as major_to_minor [], but got shard_shape=")));
+        absl_testing::StatusIs(
+            tsl::error::INVALID_ARGUMENT,
+            HasSubstr(
+                "CompactLayout expects Shape with the same number of "
+                "dimensions as major_to_minor [], but got shard_shape=")));
+  }
+}
+
+TEST(LayoutTest, ByteSize) {
+  auto client = std::make_unique<MockClient>();
+  ON_CALL(*client, MakeDeviceList)
+      .WillByDefault([](absl::Span<Device* const> devices) -> DeviceListRef {
+        return BasicDeviceList::Create(devices);
+      });
+  Shape shape({6, 2});
+  Shape shard_shape({3, 2});
+  auto device0 = std::make_unique<MockDevice>();
+  auto device1 = std::make_unique<MockDevice>();
+  ON_CALL(*device0, client()).WillByDefault(Return(client.get()));
+  ON_CALL(*device1, client()).WillByDefault(Return(client.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      DeviceListRef device_list,
+      client->MakeDeviceList({device0.get(), device1.get()}));
+  ShardingRef sharding = ConcreteEvenSharding::Create(
+      device_list, MemoryKind(), shape, shard_shape,
+      /*is_fully_replicated=*/false);
+
+  TF_ASSERT_OK_AND_ASSIGN(LayoutRef layout, CompactLayout::Create({1, 0}));
+
+  // Using a custom layout.
+  EXPECT_THAT(Layout::ByteSize(DType(DType::kS32), shape, sharding, layout),
+              IsOkAndHolds(Optional(24)));
+
+  // Using a default layout.
+  EXPECT_CALL(*client, GetDefaultLayout(DType(DType::kS32), shard_shape, _))
+      .WillOnce(Return(layout));
+
+  EXPECT_THAT(Layout::ByteSize(DType(DType::kS32), shape, sharding,
+                               /*layout=*/nullptr),
+              IsOkAndHolds(Optional(24)));
+}
+
+TEST(LayoutTest, NulloptByteSizeStatic) {
+  auto client = std::make_unique<MockClient>();
+  ON_CALL(*client, MakeDeviceList)
+      .WillByDefault([](absl::Span<Device* const> devices) -> DeviceListRef {
+        return BasicDeviceList::Create(devices);
+      });
+  auto device0 = std::make_unique<MockDevice>();
+  auto device1 = std::make_unique<MockDevice>();
+  ON_CALL(*device0, client()).WillByDefault(Return(client.get()));
+  ON_CALL(*device1, client()).WillByDefault(Return(client.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      DeviceListRef device_list,
+      client->MakeDeviceList({device0.get(), device1.get()}));
+
+  {
+    Shape shape({});
+    Shape shard_shape({});
+    ShardingRef sharding = ConcreteEvenSharding::Create(
+        device_list, MemoryKind(), shape, shard_shape,
+        /*is_fully_replicated=*/false);
+    TF_ASSERT_OK_AND_ASSIGN(LayoutRef layout, CompactLayout::Create({}));
+    EXPECT_THAT(Layout::ByteSize(DType(DType::kToken), shape, sharding, layout),
+                IsOkAndHolds(std::nullopt));
+  }
+  {
+    Shape shape({5, 2});
+    ShardingRef sharding = ConcreteSharding::Create(
+        device_list, MemoryKind(), shape,
+        /*shard_shapes=*/{Shape({3, 2}), Shape({2, 2})});
+    TF_ASSERT_OK_AND_ASSIGN(LayoutRef layout, CompactLayout::Create({1, 0}));
+    EXPECT_THAT(Layout::ByteSize(DType(DType::kS32), shape, sharding, layout),
+                IsOkAndHolds(std::nullopt));
   }
 }
 
@@ -182,14 +254,14 @@ TEST(LayoutTest, EquivalentLayouts) {
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout1),
-        IsOkAndHolds(false));
+        absl_testing::IsOkAndHolds(false));
     EXPECT_THAT(
         EquivalentLayouts(
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout1,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0),
-        IsOkAndHolds(false));
+        absl_testing::IsOkAndHolds(false));
   }
 
   // Two same concrete layouts are equivalent.
@@ -202,7 +274,7 @@ TEST(LayoutTest, EquivalentLayouts) {
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout1),
-        IsOkAndHolds(true));
+        absl_testing::IsOkAndHolds(true));
   }
   // Two different concrete layouts are not equivalent.
   {
@@ -214,7 +286,7 @@ TEST(LayoutTest, EquivalentLayouts) {
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout1),
-        IsOkAndHolds(false));
+        absl_testing::IsOkAndHolds(false));
   }
 
   // Default layouts are equivalent if they resolve to the same concrete layout.
@@ -227,14 +299,14 @@ TEST(LayoutTest, EquivalentLayouts) {
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout1),
-        IsOkAndHolds(true));
+        absl_testing::IsOkAndHolds(true));
     EXPECT_THAT(
         EquivalentLayouts(
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device1.get(), MemoryKind()), layout1),
-        IsOkAndHolds(true));
+        absl_testing::IsOkAndHolds(true));
   }
   // Default layouts are not equivalent if they resolve to different concrete
   // layouts.
@@ -247,7 +319,32 @@ TEST(LayoutTest, EquivalentLayouts) {
             SingleDeviceSharding::Create(device0.get(), MemoryKind()), layout0,
             DType(DType::kS32), shape,
             SingleDeviceSharding::Create(device2.get(), MemoryKind()), layout1),
-        IsOkAndHolds(false));
+        absl_testing::IsOkAndHolds(false));
+  }
+
+  // Default layout resolution should use shard shapes, not global shapes.
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        DeviceListRef device_list0,
+        client->MakeDeviceList({device0.get(), device1.get()}));
+    TF_ASSERT_OK_AND_ASSIGN(
+        DeviceListRef device_list1,
+        client->MakeDeviceList({device1.get(), device0.get()}));
+    Shape global_shape0({6, 2});
+    Shape global_shape1({3, 4});
+    LayoutRef layout0 = nullptr;
+    LayoutRef layout1 = nullptr;
+    EXPECT_THAT(EquivalentLayouts(
+                    DType(DType::kS32), global_shape0,
+                    ConcreteEvenSharding::Create(
+                        device_list0, MemoryKind(), /*shape=*/global_shape0,
+                        /*shard_shape=*/shape, /*is_fully_replicated=*/false),
+                    layout0, DType(DType::kS32), global_shape1,
+                    ConcreteEvenSharding::Create(
+                        device_list1, MemoryKind(), /*shape=*/global_shape1,
+                        /*shard_shape=*/shape, /*is_fully_replicated=*/false),
+                    layout1),
+                absl_testing::IsOkAndHolds(true));
   }
 }
 

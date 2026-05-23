@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "xla/pjrt/mlir_to_hlo.h"
 
-#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +25,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -79,6 +79,9 @@ limitations under the License.
 #include "xla/util.h"
 
 namespace xla {
+namespace {
+using mlir::mhlo::ChloLegalizeToHighLevelMhloPassOptions;
+}
 
 void RegisterAllHloDialects(mlir::DialectRegistry& registry) {
   registry.insert<mlir::arith::ArithDialect>();
@@ -91,14 +94,40 @@ void RegisterAllHloDialects(mlir::DialectRegistry& registry) {
   mlir::stablehlo::registerAllDialects(registry);
 }
 
-absl::Status MlirToXlaComputation(mlir::ModuleOp module,
-                                  XlaComputation& xla_computation,
-                                  bool use_tuple_args, bool return_tuple,
-                                  ExecutableBuildOptions* exec_build_options) {
+absl::Status MlirToXlaComputation(
+    mlir::ModuleOp module, XlaComputation& xla_computation, bool use_tuple_args,
+    bool return_tuple, ExecutableBuildOptions* exec_build_options,
+    const ChloLegalizeToHighLevelMhloPassOptions& chlo_opts) {
   mlir::MLIRContext* context = module->getContext();
   mlir::BaseScopedDiagnosticHandler diagnostic_handler(context);
   {
     mlir::PassManager pm(context);
+
+    // TODO(b/420837831): Remove this once we don't need to fall back to GSPMD.
+    if (exec_build_options && exec_build_options->use_shardy_partitioner() &&
+        xla::sdy::hasGspmdAttrsOrOps(module)) {
+      LOG(WARNING)
+          << "Module has GSPMD attrs or ops, but Shardy is enabled. Disabling "
+             "Shardy and falling back to using GSPMD propagation.";
+      exec_build_options->set_use_shardy_partitioner(false);
+      // HloShardingV3 is enabled with Shardy so in case of GSPMD fallback we
+      // disable it.
+      exec_build_options->mutable_debug_options()
+          ->set_xla_enable_hlo_sharding_v3(false);
+      RETURN_IF_ERROR(ExportShardyForGSPMD(module));
+    }
+
+    // Export a StableHLO + Shardy module into a pure StableHLO module, to
+    // prepare for a round trip to HLO, such that the Shardy ops and attributes
+    // are preserved when going back to MLIR for Shardy propagation. This is a
+    // no-op if the module is already pure StableHLO.
+    // NOTE: we don't use `use_shardy` because it isn't guaranteed to be true if
+    // the module has Shardy artifacts.
+    bool enable_hlo_sharding_v3 =
+        exec_build_options && exec_build_options->has_debug_options() &&
+        exec_build_options->debug_options().xla_enable_hlo_sharding_v3();
+    xla::sdy::addSdyRoundTripExportPipeline(pm, /*keepMeshesInlined=*/false,
+                                            enable_hlo_sharding_v3);
 
     // CHLO -> MHLO for high level ops (TopK, Erf, RaggedDot, etc.)
     // CHLO -> StableHLO otherwise
@@ -106,7 +135,7 @@ absl::Status MlirToXlaComputation(mlir::ModuleOp module,
         mlir::stablehlo_ext::createChloRecomposeOpsPass());
     pm.addPass(mlir::createSymbolDCEPass());
     pm.addNestedPass<mlir::func::FuncOp>(
-        mlir::mhlo::createChloLegalizeToHighLevelMhloPass());
+        mlir::mhlo::createChloLegalizeToHighLevelMhloPass(chlo_opts));
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::stablehlo::createChloLegalizeToStablehloPass());
 
@@ -118,24 +147,6 @@ absl::Status MlirToXlaComputation(mlir::ModuleOp module,
     // regions, since XLA uses functional control flow.
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::stablehlo_ext::createSinkConstantsToControlFlowPass());
-
-    // TODO(b/420837831): Remove this once we don't need to fall back to GSPMD.
-    if (exec_build_options && exec_build_options->use_shardy_partitioner() &&
-        xla::sdy::hasGspmdAttrsOrOps(module)) {
-      LOG(WARNING)
-          << "Module has GSPMD attrs or ops, but Shardy is enabled. Disabling "
-             "Shardy and falling back to using GSPMD propagation.";
-      exec_build_options->set_use_shardy_partitioner(false);
-      TF_RETURN_IF_ERROR(ExportShardyForGSPMD(module));
-    }
-
-    // Export a StableHLO + Shardy module into a pure StableHLO module, to
-    // prepare for a round trip to HLO, such that the Shardy ops and attributes
-    // are preserved when going back to MLIR for Shardy propagation. This is a
-    // no-op if the module is already pure StableHLO.
-    // NOTE: we don't use `use_shardy` because it isn't guaranteed to be true if
-    // the module has Shardy artifacts.
-    xla::sdy::addSdyRoundTripExportPipeline(pm);
 
     if (failed(pm.run(module))) {
       VLOG(1) << "MHLO->HLO lowering passes failed.";
@@ -159,9 +170,9 @@ absl::Status MlirToXlaComputation(mlir::ModuleOp module,
     use_tuple_args = false;
   }
 
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
-                      xla::ConvertStablehloToHloWithOptions(
-                          module, use_tuple_args, return_tuple));
+  ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
+                   xla::ConvertStablehloToHloWithOptions(module, use_tuple_args,
+                                                         return_tuple));
 
   xla_computation = XlaComputation(hlo_module->ToProto());
   return absl::OkStatus();
@@ -188,7 +199,7 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> ParseMlirModuleString(
     return diagnostic_handler.ConsumeStatus();
   }
 
-  TF_RETURN_IF_ERROR(UpgradeVersionedStablehlo(*module));
+  RETURN_IF_ERROR(UpgradeVersionedStablehlo(*module));
   return std::move(module);
 }
 
@@ -196,8 +207,8 @@ absl::Status ParseMlirModuleStringAndConvertToXlaComputation(
     absl::string_view mlir_module_str, XlaComputation& xla_computation,
     bool use_tuple_args, bool return_tuple) {
   mlir::MLIRContext context;
-  TF_ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
-                      xla::ParseMlirModuleString(mlir_module_str, context));
+  ASSIGN_OR_RETURN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                   xla::ParseMlirModuleString(mlir_module_str, context));
   return xla::MlirToXlaComputation(*module, xla_computation, use_tuple_args,
                                    return_tuple,
                                    /*exec_build_options=*/nullptr);
@@ -228,6 +239,7 @@ absl::Status ExportShardyForGSPMD(mlir::ModuleOp module) {
   // to handle.
   xla::sdy::StablehloExportPipelineOptions options;
   options.keepHloShardingConstraints = true;
+  options.addMissingShardingToControlFlow = false;
   xla::sdy::addStablehloExportPipeline(pm, options);
   mlir::BaseScopedDiagnosticHandler diagnostic_handler(context);
   if (!mlir::succeeded(pm.run(module))) {
@@ -240,27 +252,36 @@ absl::Status ExportShardyForGSPMD(mlir::ModuleOp module) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> SerializeUsingNativeBytecode(
+std::optional<mlir::StringRef> FindPotentiallyUnstableDialects(
     mlir::ModuleOp module) {
-  std::string bytecode;
-  llvm::raw_string_ostream os(bytecode);
-  mlir::BytecodeWriterConfig config;
-  // Pin bytecode version to 1 until transition to stable.
-  // TODO: b/285913864 - Remove post enabling frameworks to set it.
-  config.setDesiredBytecodeVersion(1);
-  // In
-  // https://github.com/google/jax/commit/184e3a88004680dbf34328b05c5fc0d869cc4a93,
-  // fields on some ops were changed to use Dense{Bool,I64}ArrayAttr instead of
-  // I64DenseElementsAttr (DenseIntElementsAttr). Some clients still expect
-  // dense elements, not dense arrays, so convert the arrays to elements before
-  // serializing. The elements need to be converted back to arrays when
-  // deserializing.
-  // TODO: b/320507168 - Remove this conversion code.
-  mlir::OwningOpRef<mlir::ModuleOp> cloned = module.clone();
-  if (mlir::failed(mlir::writeBytecodeToFile(*cloned, os, config))) {
-    return absl::InvalidArgumentError("mlir::writeBytecodeToFile failed");
+  // Stable dialects that may not be registered in current mlir context
+  mlir::DenseSet<mlir::StringRef> stable_dialects{"mpmd"};
+
+  // Check that all ops are from known stable dialects.
+  std::optional<mlir::StringRef> unstable_dialect = std::nullopt;
+  module->walk([&](mlir::Operation* op) {
+    mlir::Dialect* dialect = op->getDialect();
+    if (!dialect ||
+        (!llvm::isa<mlir::stablehlo::StablehloDialect, mlir::chlo::ChloDialect,
+                    mlir::sdy::SdyDialect>(dialect) &&
+         !llvm::isa<mlir::ModuleOp, mlir::func::FuncOp, mlir::func::CallOp,
+                    mlir::func::ReturnOp>(op) &&
+         !stable_dialects.contains(dialect->getNamespace()))) {
+      unstable_dialect = op->getName().getStringRef();
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  return unstable_dialect;
+}
+
+// Helper method to convert a mlir::FailureOr<T> to an absl::StatusOr<T>.
+template <typename T>
+absl::StatusOr<T> ExpectSuccess(mlir::FailureOr<T> result, std::string msg) {
+  if (mlir::failed(result)) {
+    return absl::InvalidArgumentError(msg);
   }
-  return bytecode;
+  return result.value();
 }
 
 absl::StatusOr<std::string> SerializeUsingVersionedStablehlo(
@@ -272,12 +293,11 @@ absl::StatusOr<std::string> SerializeUsingVersionedStablehlo(
   // Usually the plugin is older than the framework, but occasionally a plugin's
   // nightly build will use the latest public release of a framework. Serialize
   // using the framework's version in these cases.
-  auto target = mlir::stablehlo::getSmallerVersion(
-      requested_target, mlir::stablehlo::getCurrentVersion());
-  if (mlir::failed(target)) {
-    return absl::InvalidArgumentError(
-        "Invalid StableHLO target version requested.");
-  }
+  ASSIGN_OR_RETURN(
+      std::string target,
+      ExpectSuccess(mlir::stablehlo::getSmallerVersion(
+                        requested_target, mlir::stablehlo::getCurrentVersion()),
+                    "Invalid StableHLO target version requested."));
 
   // Legalize CHLO -> [StableHLO+Shape] -> StableHLO
   // Preserve higher-level ops with XLA support. To be replaced by composites.
@@ -292,11 +312,15 @@ absl::StatusOr<std::string> SerializeUsingVersionedStablehlo(
   if (!allow_mixed_serialization) {
     xla::sdy::addSdyRoundTripExportPipeline(pm);
   }
+
+  pm.addNestedPass<mlir::func::FuncOp>(
+      mlir::stablehlo_ext::createChloScanToReduceWindowPass({target}));
+
   pm.addPass(mlir::stablehlo_ext::createChloPreserveHighLevelOpsPass());
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::stablehlo::createChloLegalizeToStablehloPass());
-  pm.addPass(mlir::stablehlo::createStablehloCompatibilityExpanderPass(
-      {target.value()}));
+  pm.addPass(
+      mlir::stablehlo::createStablehloCompatibilityExpanderPass({target}));
   pm.addNestedPass<mlir::func::FuncOp>(
       mlir::stablehlo::createChloLegalizeToStablehloPass());
   pm.addNestedPass<mlir::func::FuncOp>(
@@ -318,18 +342,27 @@ absl::StatusOr<std::string> SerializeUsingVersionedStablehlo(
     mlir_module = *cloned;
   }
 
+  // Only allow mixed serialization of stable dialects.
+  if (allow_mixed_serialization) {
+    auto unstable_dialect_op = FindPotentiallyUnstableDialects(mlir_module);
+    if (unstable_dialect_op.has_value()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Failed to serialize StableHLO with mixed dialects to plugin "
+          "version ",
+          target, "; found unstable op: ", unstable_dialect_op.value().str()));
+    }
+  }
+
   // Serialize portable artifact
   std::string buffer;
   llvm::raw_string_ostream os(buffer);
-  // TODO(gleasonk): make `allowOtherDialects` an allow-list of dialects instead
-  // of a boolean.
   if (mlir::failed(mlir::stablehlo::serializePortableArtifact(
-          mlir_module, target.value(), os,
+          mlir_module, target, os,
           /*allowOtherDialects=*/allow_mixed_serialization))) {
     const absl::Status status = diagnostic_handler.ConsumeStatus();
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Failed to serialize StableHLO to plugin version ", target.value(),
-        ";\n\nDetailed error from MLIR: ", status.message()));
+    return absl::InvalidArgumentError(
+        absl::StrCat("Failed to serialize StableHLO to plugin version ", target,
+                     ";\n\nDetailed error from MLIR: ", status.message()));
   }
   return buffer;
 }
@@ -343,14 +376,7 @@ absl::Status UpgradeVersionedStablehlo(mlir::ModuleOp mlir_module) {
   return absl::OkStatus();
 }
 
-std::string GetDefaultStablehloVersion(std::optional<int64_t> plugin_version) {
-  // TODO: (b/370803410) Use WEEK_12 in PJRT, some plugins were not up to date,
-  // so temporarily using 1.0.0 to allow them time for a new release.
-  // PJRT v54 released Jun 10, so most plugins should use WEEK_12 by default.
-  if (plugin_version.has_value() && plugin_version.value() < 54) {
-    return "0.19.0";
-  }
-
+std::string GetDefaultStablehloVersion() {
   // This version must be >=12w old.
   return mlir::vhlo::Version::fromCompatibilityRequirement(
              mlir::vhlo::Version::CompatibilityRequirement::WEEK_12)
@@ -358,34 +384,9 @@ std::string GetDefaultStablehloVersion(std::optional<int64_t> plugin_version) {
 }
 
 absl::StatusOr<std::string> Serialize(mlir::ModuleOp module,
-                                      absl::string_view target,
-                                      std::optional<int64_t> plugin_version,
-                                      bool inplace) {
-  // Current PJRT users expect 12 weeks forward compat, VHLO provides this
-  // compat.
-  // TODO (b/344930098): Allow VHLO interop and remove the all_stablehlo check
-  bool all_stablehlo_or_shardy = true;
-  module->walk([&](mlir::Operation* op) {
-    if (!llvm::isa<mlir::ModuleOp>(op) &&
-        !llvm::isa<mlir::stablehlo::StablehloDialect, mlir::func::FuncDialect,
-                   mlir::chlo::ChloDialect, mlir::sdy::SdyDialect>(
-            op->getDialect())) {
-      all_stablehlo_or_shardy = false;
-      return mlir::WalkResult::interrupt();
-    }
-    return mlir::WalkResult::advance();
-  });
-  if (!all_stablehlo_or_shardy) {
-    return SerializeUsingNativeBytecode(module);
-  }
-  // All Shardy and StableHLO has compatibility even with mixed serialization
-  // if plugin version >= 70.
-  // TODO(b/422690222): remove the plugin version check once the forward
-  // compatibility window is passed.
+                                      absl::string_view target, bool inplace) {
   return SerializeUsingVersionedStablehlo(module, target, inplace,
-                                          !plugin_version.has_value() ||
-                                              *plugin_version == 0 ||
-                                              *plugin_version >= 70);
+                                          /*allow_mixed_serialization=*/true);
 }
 
 }  // namespace xla

@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/error_spec.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/verified_hlo_module.h"
@@ -209,7 +210,7 @@ class HloRunnerAgnosticReferenceMixin : public T {
             "reference preprocessor must not modify the program shape");
       }
     }
-    TF_RETURN_IF_ERROR(this->verifier().Run(reference_module.get()).status());
+    RETURN_IF_ERROR(this->verifier().Run(reference_module.get()).status());
     return std::move(reference_module);
   }
 
@@ -222,26 +223,38 @@ class HloRunnerAgnosticReferenceMixin : public T {
       const std::optional<ErrorSpec>& error, bool run_hlo_passes,
       const std::function<void(HloModule*)>& reference_preprocessor = nullptr,
       const std::function<void(HloModule*)>& test_preprocessor = nullptr) {
-    TF_RETURN_IF_ERROR(this->verifier().Run(module.get()).status());
-    TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> reference_module,
-                        MakeReferenceModule(*module, reference_preprocessor));
-    TF_RETURN_IF_ERROR(this->PreprocessModuleForTestRunner(module.get()));
+    RETURN_IF_ERROR(this->verifier().Run(module.get()).status());
+    ASSIGN_OR_RETURN(std::unique_ptr<HloModule> reference_module,
+                     MakeReferenceModule(*module, reference_preprocessor));
+    RETURN_IF_ERROR(this->PreprocessModuleForTestRunner(module.get()));
     if (test_preprocessor != nullptr) {
       test_preprocessor(module.get());
     }
     // Execute on two backends.
-    TF_ASSIGN_OR_RETURN(const Literal test,
-                        this->test_runner().Execute(std::move(module),
-                                                    arguments, run_hlo_passes));
-    TF_ASSIGN_OR_RETURN(const Literal reference,
-                        reference_runner_->Execute(std::move(reference_module),
-                                                   arguments, run_hlo_passes));
-    if (reference.IsAll(0)) {
+    const absl::StatusOr<Literal> test = this->test_runner().Execute(
+        std::move(module), arguments, run_hlo_passes);
+    if (!this->swallow_execution_errors() && !test.ok()) {
+      // Exit early if we aren't swallowing errors.
+      return test.status();
+    }
+    const absl::StatusOr<Literal> reference = reference_runner_->Execute(
+        std::move(reference_module), arguments, run_hlo_passes);
+    if (this->swallow_execution_errors() && !test.ok()) {
+      return ::testing::AssertionSuccess();
+    }
+    if (!reference.ok()) {
+      if (this->swallow_execution_errors()) {
+        return ::testing::AssertionSuccess();
+      }
+      return reference.status();
+    }
+
+    if (reference->IsAll(0)) {
       LOG(WARNING) << "Reference value is only zeros.";
     }
 
-    return LiteralTestUtil::NearOrEqual(/*expected=*/reference, /*actual=*/test,
-                                        error);
+    return LiteralTestUtil::NearOrEqual(/*expected=*/*reference,
+                                        /*actual=*/*test, error);
   }
 
   std::unique_ptr<HloRunnerInterface> reference_runner_;

@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "xla/hlo/ir/hlo_module.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -24,19 +23,23 @@ limitations under the License.
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/comparison_util.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_module_metadata.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_original_value.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/test.h"
 #include "xla/hlo/testlib/verified_hlo_module.h"
@@ -44,6 +47,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/literal_util.h"
 #include "xla/service/buffer_value.h"
+#include "xla/service/compilation_environments.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/test_compilation_environment.pb.h"
@@ -52,10 +56,10 @@ limitations under the License.
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/tuple_tree.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/casts.h"
-#include "tsl/platform/protobuf.h"
 
 namespace xla {
 
@@ -64,7 +68,7 @@ namespace xla {
 std::unique_ptr<tsl::protobuf::Message> ProcessNewEnv(
     std::unique_ptr<tsl::protobuf::Message> msg) {
   std::unique_ptr<test::TestCompilationEnvironment1> env(
-      tensorflow::down_cast<test::TestCompilationEnvironment1*>(msg.release()));
+      absl::down_cast<test::TestCompilationEnvironment1*>(msg.release()));
   if (!env) {
     env = std::make_unique<test::TestCompilationEnvironment1>();
     env->set_some_flag(100);
@@ -170,9 +174,8 @@ TEST_F(HloModuleTest, CloneFrontendAttributes) {
   frontend_attributes.mutable_map()->emplace("attribute1", "attribute1_value");
   module->set_frontend_attributes(frontend_attributes);
   std::unique_ptr<HloModule> clone = module->Clone();
-  bool areEqual = std::equal(
-      frontend_attributes.map().begin(), frontend_attributes.map().end(),
-      clone->frontend_attributes().map().begin(),
+  bool areEqual = absl::c_equal(
+      frontend_attributes.map(), clone->frontend_attributes().map(),
       [](const auto& kv1, const auto& kv2) {
         return kv1.first == kv2.first && kv1.second == kv2.second;
       });
@@ -482,10 +485,11 @@ ENTRY ReduceR3ToR2.v3 {
   EXPECT_NE(module->unique_id(), module_copy->unique_id());
 
   // Verify that the computations and instructions all have the same unique id.
-  auto computation_copy = module_copy->computations();
-  auto computation_copy_it = computation_copy.begin();
   for (const HloComputation* computation_orig : module->computations()) {
-    const HloComputation* computation_copy = *computation_copy_it++;
+    HloComputation* computation_copy =
+        module_copy->GetComputationWithName(computation_orig->name());
+    ASSERT_NE(computation_copy, nullptr)
+        << "Computation not found: " << computation_orig->name();
     EXPECT_EQ(computation_orig->unique_id(), computation_copy->unique_id())
         << absl::StrFormat(
                "ID of original computation %s != ID of deserialized "
@@ -493,10 +497,12 @@ ENTRY ReduceR3ToR2.v3 {
                computation_orig->name(), computation_copy->name(),
                computation_orig->unique_id(), computation_copy->unique_id());
 
-    auto instruction_copy_it = computation_copy->instructions().begin();
     for (const HloInstruction* instruction_orig :
          computation_orig->instructions()) {
-      const HloInstruction* instruction_copy = *instruction_copy_it++;
+      const HloInstruction* instruction_copy =
+          computation_copy->GetInstructionWithName(instruction_orig->name());
+      ASSERT_NE(instruction_copy, nullptr)
+          << "Instruction not found: " << instruction_orig->name();
       EXPECT_EQ(instruction_orig->unique_id(), instruction_copy->unique_id())
           << absl::StrFormat(
                  "ID of original instruction %s != ID of deserialized "
@@ -506,13 +512,19 @@ ENTRY ReduceR3ToR2.v3 {
     }
   }
 
-  // Verify that the next unique ID which the module would have handed out is
-  // greater than the unique id of any instruction.
-  int next_id = module_copy->NewUniqueInstructionId();
+  // Verify that the next unique ID which any computation would have handed out
+  // is greater than the unique id of any existing instruction in that
+  // computation.
+  int32_t next_module_unique_id = module->next_unique_computation_id();
   for (const HloComputation* computation : module_copy->computations()) {
+    int32_t next_instruction_id_internal =
+        computation->next_unique_instruction_internal_id();
     for (const HloInstruction* instruction : computation->instructions()) {
-      EXPECT_GT(next_id, instruction->unique_id());
+      EXPECT_GT(next_instruction_id_internal, instruction->local_id());
     }
+    // Also verify that the next module unique id is greater than the module
+    // unique ids already present in the computation.
+    EXPECT_GT(next_module_unique_id, computation->unique_id());
   }
 }
 
@@ -930,7 +942,7 @@ ENTRY main {
 }
 )";
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(text));
-  EXPECT_TRUE(module->get_stack_frame(1).empty());
+  EXPECT_TRUE(module->get_stack_frame(StackFrameId{1}).empty());
 
   auto module_proto = module->ToProto();
   auto index = module_proto.mutable_stack_frame_index();
@@ -954,10 +966,12 @@ ENTRY main {
       auto module_with_stack_frames,
       HloModule::CreateFromProto(module_proto, module->config()));
 
-  EXPECT_TRUE(module_with_stack_frames->get_stack_frame(0).empty());
-  EXPECT_TRUE(module_with_stack_frames->get_stack_frame(2).empty());
+  EXPECT_TRUE(
+      module_with_stack_frames->get_stack_frame(StackFrameId{0}).empty());
+  EXPECT_TRUE(
+      module_with_stack_frames->get_stack_frame(StackFrameId{2}).empty());
 
-  auto stack_frame = module_with_stack_frames->get_stack_frame(1);
+  auto stack_frame = module_with_stack_frames->get_stack_frame(StackFrameId{1});
   EXPECT_EQ(stack_frame.file_name, index->file_names(0));
   EXPECT_EQ(stack_frame.function_name, index->function_names(0));
   EXPECT_EQ(stack_frame.line, location->line());
@@ -971,10 +985,9 @@ TEST_F(HloModuleTest, PrintOriginalValue) {
   std::vector<float> values(16, 42.0);
   auto instruction =
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(42.0f));
-  auto original_value = std::make_shared<OriginalValue>(instruction->shape());
-  for (auto& leaf : original_value->leaves()) {
-    leaf.second = {std::string(instruction->name()), leaf.first};
-  }
+  auto original_value =
+      std::make_shared<OriginalValue>(TupleTree<std::optional<OriginalArray>>(
+          OriginalArray{std::string(instruction->name()), {}}));
   instruction->set_original_value(original_value);
   builder.AddInstruction(std::move(instruction));
   module->AddEntryComputation(builder.Build());

@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
 #include "xla/hlo/analysis/hlo_alias_analysis.h"
@@ -36,6 +37,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
+#include "xla/hlo/utils/hlo_stack_trace.h"
 #include "xla/service/hlo_buffer.h"
 #include "xla/service/hlo_value.h"
 #include "xla/shape_util.h"
@@ -120,6 +122,8 @@ void HloLiveRange::FlattenSchedule(const HloComputation& computation,
                               : async_context);
         }
       } else if (instruction->opcode() == HloOpcode::kWhile) {
+        // Order of flattening matters here: for while loops, the condition
+        // must be flattened first, then the body.
         FlattenSchedule(*instruction->while_condition(), async_context);
         FlattenSchedule(*instruction->while_body(), async_context);
       }
@@ -349,6 +353,12 @@ std::string HloLiveRange::ToString() const {
                           "    %s%s: %lld bytes (cumulative: %lld bytes)\n",
                           value->instruction()->name(),
                           value->index().ToString(), bytes, total_bytes);
+  }
+
+  const HloModule* module =
+      instructions.empty() ? nullptr : instructions[0]->GetModule();
+  if (module != nullptr) {
+    absl::StrAppend(&output, FormatStackTraceBreakdown(sized_buffers, module));
   }
 
   return output;

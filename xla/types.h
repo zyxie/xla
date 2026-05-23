@@ -19,14 +19,26 @@ limitations under the License.
 #include <complex>
 #include <cstdint>
 #include <limits>
-#include <string>
 #include <type_traits>
 
+#include "absl/numeric/int128.h"
 #include "absl/strings/str_cat.h"
 #include "Eigen/Core"  // IWYU pragma: export
+#include "ml_dtypes/include/intn.h"
 #include "tsl/platform/ml_dtypes.h"  // IWYU pragma: export
 
 namespace xla {
+
+using ::tsl::float4_e2m1fn;  // NOLINT(misc-unused-using-decls)
+
+using ::tsl::float8_e3m4;         // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e4m3;         // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e4m3b11fnuz;  // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e4m3fn;       // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e4m3fnuz;     // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e5m2;         // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e5m2fnuz;     // NOLINT(misc-unused-using-decls)
+using ::tsl::float8_e8m0fnu;      // NOLINT(misc-unused-using-decls)
 
 using ::Eigen::bfloat16;  // NOLINT(misc-unused-using-decls)
 using ::Eigen::half;      // NOLINT(misc-unused-using-decls)
@@ -112,12 +124,22 @@ struct make_specialized_unsigned<T, typename std::enable_if_t<is_intN_v<T>>> {
                         std::make_unsigned_t<typename T::underlying_type>>;
 };
 
+template <>
+struct make_specialized_unsigned<absl::int128> {
+  using type = absl::uint128;
+};
+
 template <typename T>
 using make_specialized_unsigned_t = typename make_specialized_unsigned<T>::type;
 
 template <typename T, typename = void>
 struct make_specialized_signed {
   using type = std::make_signed_t<T>;
+};
+
+template <>
+struct make_specialized_signed<absl::uint128> {
+  using type = absl::int128;
 };
 
 template <typename T>

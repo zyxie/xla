@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_TSL_PROFILER_UTILS_TF_OP_UTILS_H_
 #define XLA_TSL_PROFILER_UTILS_TF_OP_UTILS_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@ enum class Category {
   kMemcpyDToH,
   kMemcpyDToD,
   kMemcpyHToH,
+  kInputPipeline,
 };
 
 // Breaks a TensorFlow op fullname into name and type.
@@ -50,8 +52,15 @@ struct TfOp {
   Category category = Category::kUnknown;
   absl::string_view name;
   absl::string_view type;
+  // stage id for input pipeline ops, to distinguish between different stage ops
+  // with the same name.
+  int64_t id;
 };
-TfOp ParseTfOpFullname(absl::string_view tf_op_fullname);
+// WARNING: Note the input to this function (tf_op_fullname) must outlive the
+// returned TfOp, as it is a string_view.
+TfOp ParseTfOpFullname(absl::string_view tf_op_fullname,
+                       Category category = Category::kUnknown,
+                       absl::string_view type = kUnknownOp, int64_t id = 0);
 
 // Returns a vector of TF name scopes extracted from a TF op name.
 std::vector<absl::string_view> ParseTfNameScopes(absl::string_view tf_op_name);
@@ -88,18 +97,25 @@ inline bool IsInfeedEnqueueOp(const TfOp& tf_op) {
 
 // Returns true if the given op has XlaSendToHost/XlaRecvFromHost in fullname.
 inline bool IsOutsideCompilationOp(absl::string_view tf_op_fullname) {
-  if (absl::EndsWith(tf_op_fullname, ":XlaSendToHost")) return true;
-  if (absl::EndsWith(tf_op_fullname, ":XlaRecvFromHost")) return true;
+  if (absl::EndsWith(tf_op_fullname, ":XlaSendToHost")) {
+    return true;
+  }
+  if (absl::EndsWith(tf_op_fullname, ":XlaRecvFromHost")) {
+    return true;
+  }
   return false;
 }
 
 // Returns true if the given op is for outside compilation.
 inline bool IsOutsideCompilationOp(absl::string_view tf_op_fullname,
                                    absl::string_view hlo_expression) {
-  if (IsOutsideCompilationOp(tf_op_fullname)) return true;
-  if (absl::StrContains(hlo_expression, "send-done") &&
-      absl::StrContains(hlo_expression, "is_host_transfer=true"))
+  if (IsOutsideCompilationOp(tf_op_fullname)) {
     return true;
+  }
+  if (absl::StrContains(hlo_expression, "send-done") &&
+      absl::StrContains(hlo_expression, "is_host_transfer=true")) {
+    return true;
+  }
   return false;
 }
 

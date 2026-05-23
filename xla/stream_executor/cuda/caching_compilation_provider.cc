@@ -20,15 +20,17 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/stream_executor/cuda/compilation_options.h"
 #include "xla/stream_executor/cuda/compilation_provider.h"
-#include "xla/stream_executor/device_description.h"
-#include "tsl/platform/statusor.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace stream_executor::cuda {
 
@@ -49,7 +51,7 @@ absl::StatusOr<Assembly> CachingCompilationProvider::Compile(
     const CompilationOptions& options) const {
   CacheKey cache_key{cc, std::string{ptx}, options};
   {
-    absl::MutexLock lock(&assembly_cache_mutex_);
+    absl::MutexLock lock(assembly_cache_mutex_);
     auto it = assembly_cache_.find(cache_key);
     if (it != assembly_cache_.end()) {
       // The iterator will get invalid during the `Await` call if the cache is
@@ -70,7 +72,7 @@ absl::StatusOr<Assembly> CachingCompilationProvider::Compile(
 
   absl::StatusOr<Assembly> assembly = delegate_->Compile(cc, ptx, options);
   {
-    absl::MutexLock lock(&assembly_cache_mutex_);
+    absl::MutexLock lock(assembly_cache_mutex_);
     assembly_cache_[cache_key] = assembly;
   }
   return assembly;
@@ -82,7 +84,7 @@ CachingCompilationProvider::CompileToRelocatableModule(
     const CompilationOptions& options) const {
   CacheKey cache_key{cc, std::string{ptx}, options};
   {
-    absl::MutexLock lock(&relocatable_module_cache_mutex_);
+    absl::MutexLock lock(relocatable_module_cache_mutex_);
     auto it = relocatable_module_cache_.find(cache_key);
     if (it != relocatable_module_cache_.end()) {
       // The iterator will get invalid during the `Await` call if the cache is
@@ -103,7 +105,7 @@ CachingCompilationProvider::CompileToRelocatableModule(
   absl::StatusOr<RelocatableModule> relocatable_module =
       delegate_->CompileToRelocatableModule(cc, ptx, options);
   {
-    absl::MutexLock lock(&relocatable_module_cache_mutex_);
+    absl::MutexLock lock(relocatable_module_cache_mutex_);
     relocatable_module_cache_[cache_key] = relocatable_module;
   }
   return relocatable_module;
@@ -126,7 +128,7 @@ absl::StatusOr<Assembly> CachingCompilationProvider::CompileAndLink(
     if (std::holds_alternative<RelocatableModule>(input)) {
       modules.push_back(std::get<RelocatableModule>(input));
     } else {
-      TF_ASSIGN_OR_RETURN(
+      ASSIGN_OR_RETURN(
           RelocatableModule relocatable_module,
           CompileToRelocatableModule(cc, std::get<Ptx>(input).ptx, options));
       modules.push_back(std::move(relocatable_module));
@@ -134,6 +136,11 @@ absl::StatusOr<Assembly> CachingCompilationProvider::CompileAndLink(
   }
 
   return delegate_->CompileAndLink(cc, modules, options);
+}
+
+absl::StatusOr<int> CachingCompilationProvider::GetLatestPtxIsaVersion() const {
+  return absl::UnimplementedError(
+      "GetLatestPtxIsaVersion is not implemented for " + name() + ".");
 }
 
 }  // namespace stream_executor::cuda

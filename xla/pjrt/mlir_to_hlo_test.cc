@@ -15,19 +15,25 @@ limitations under the License.
 
 #include "xla/pjrt/mlir_to_hlo.h"
 
+#include <string>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "stablehlo/api/PortableApi.h"
 #include "xla/hlo/testlib/test.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 using ::testing::Not;
 
@@ -40,7 +46,7 @@ MATCHER_P(IsVhloArtifact, version, "") {
 }
 
 TEST(MlirToHloTest, StablehloTest) {
-  constexpr char kProgram[] =
+  constexpr absl::string_view kProgram =
       R"(
     func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
       %cst = stablehlo.constant dense<1.0> : tensor<1x2xf32>
@@ -51,14 +57,14 @@ TEST(MlirToHloTest, StablehloTest) {
   mlir::MLIRContext context;
   TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
                           ParseMlirModuleString(kProgram, context));
-  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0", 70));
+  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0"));
 
   // StableHLO uses VHLO for PJRT serialization.
   EXPECT_THAT(blob, IsVhloArtifact("1.0.0"));
 }
 
 TEST(MlirToHloTest, StablehloPluginNewerThanFramework) {
-  constexpr char kProgram[] =
+  constexpr absl::string_view kProgram =
       R"(
     func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
       %cst = stablehlo.constant dense<1.0> : tensor<1x2xf32>
@@ -72,13 +78,12 @@ TEST(MlirToHloTest, StablehloPluginNewerThanFramework) {
 
   // Request version v100.99.88, newer than the framework version.
   // Serialize uses frameworks version when plugin requests a newer version.
-  TF_ASSERT_OK_AND_ASSIGN(std::string blob,
-                          Serialize(*module, "100.99.98", 70));
+  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "100.99.98"));
   EXPECT_THAT(blob, IsVhloArtifact(mlir::stablehlo::getCurrentVersion()));
 }
 
 TEST(MlirToHloTest, ChloTest) {
-  constexpr char kProgram[] =
+  constexpr absl::string_view kProgram =
       R"(
     func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
       %cst = stablehlo.constant dense<1.0> : tensor<1x2xf32>
@@ -89,14 +94,14 @@ TEST(MlirToHloTest, ChloTest) {
   mlir::MLIRContext context;
   TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
                           ParseMlirModuleString(kProgram, context));
-  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0", 70));
+  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0"));
 
   // CHLO decomposes to StableHLO, so uses VHLO serialization.
   EXPECT_THAT(blob, IsVhloArtifact("1.0.0"));
 }
 
 TEST(MlirToHloTest, ChloTanOpTest) {
-  constexpr char kProgram[] =
+  constexpr absl::string_view kProgram =
       R"(
     func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
       %0 = chlo.tan %arg0 : tensor<1x2xf32> -> tensor<1x2xf32>
@@ -106,28 +111,71 @@ TEST(MlirToHloTest, ChloTanOpTest) {
   mlir::MLIRContext context;
   TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
                           ParseMlirModuleString(kProgram, context));
-  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0", 70));
+  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0"));
 
   // CHLO decomposes to StableHLO, so uses VHLO serialization.
   EXPECT_THAT(blob, IsVhloArtifact("1.0.0"));
 }
 
-TEST(MlirToHloTest, MhloTest) {
-  constexpr char kProgram[] =
+TEST(MlirToHloTest, MhloMixedSerializationTest) {
+  constexpr absl::string_view kProgram =
       R"(
     func.func @add(%arg0: tensor<1x2xf32>) -> tensor<1x2xf32> {
       %cst = mhlo.constant dense<1.0> : tensor<1x2xf32>
-      %0 = mhlo.add %arg0, %cst : tensor<1x2xf32>
+      %0 = stablehlo.add %arg0, %cst : tensor<1x2xf32>
       return %0 : tensor<1x2xf32>
     }
   )";
   mlir::MLIRContext context;
   TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
                           ParseMlirModuleString(kProgram, context));
-  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.0.0", 70));
+  TF_ASSERT_OK_AND_ASSIGN(std::string blob, Serialize(*module, "1.11.0"));
 
-  // MHLO and other dialects use native MLIR bytecode, not VHLO.
-  EXPECT_THAT(blob, Not(IsVhloArtifact("1.0.0")));
+  // Use Mixed serialization starting at v1.11.0.
+  EXPECT_THAT(blob, IsVhloArtifact("1.11.0"));
+}
+
+TEST(MlirToHloTest, MhloMixedSerializationTest_UnstableDialect) {
+  constexpr absl::string_view kProgram =
+      R"(
+  module {
+    func.func @main() -> tensor<16xf32> {
+      %f = constant @helper : () -> tensor<16xf32>
+      %0 = call_indirect %f() : () -> tensor<16xf32>
+      return %0 : tensor<16xf32>
+    }
+    func.func @helper() -> tensor<16xf32> {
+      %cst = stablehlo.constant dense<1.000000e+00> : tensor<16xf32>
+      return %cst : tensor<16xf32>
+    }
+  }
+  )";
+  mlir::MLIRContext context;
+  TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                          ParseMlirModuleString(kProgram, context));
+
+  // Use Mixed serialization starting at v1.11.0.
+  EXPECT_THAT(Serialize(*module, "1.11.0"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("found unstable op: func.constant")));
+}
+
+TEST(MlirToHloTest, MhloMixedSerializationTest_UnregisteredDialect) {
+  constexpr absl::string_view kProgram =
+      R"(
+    func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
+      %0 = "UnknownOp"(%arg0) : (tensor<f32>) -> tensor<f32>
+      return %0 : tensor<f32>
+    }
+  )";
+  mlir::MLIRContext context;
+  context.allowUnregisteredDialects();
+  TF_ASSERT_OK_AND_ASSIGN(mlir::OwningOpRef<mlir::ModuleOp> module,
+                          ParseMlirModuleString(kProgram, context));
+
+  EXPECT_THAT(Serialize(*module, "1.11.0"),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("found unstable op: UnknownOp")));
 }
 
 TEST(MlirToHloTest, InvalidBytecodeTest) {

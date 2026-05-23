@@ -15,22 +15,30 @@ limitations under the License.
 
 #include "xla/service/executable.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
+#include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "absl/strings/str_format.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "xla/debug_options_flags.h"
-#include "xla/service/dump.h"
-#include "xla/service/hlo_graph_dumper.h"
-#include "xla/service/maybe_owning_device_memory.h"
+#include "xla/tsl/platform/status_macros.h"
+#include "xla/service/maybe_owning_device_address.h"
+#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_buffer.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/status_macros.h"
-#include "xla/stream_executor/device_description.h"
-#include "tsl/platform/env.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/status.h"
+#include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/device_address_allocator.h"
+#include "xla/stream_executor/stream.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -43,19 +51,27 @@ ExecutionInput::~ExecutionInput() {
   }
 }
 
+ExecutionInput::ExecutionInput(ExecutionInput&& rhs) noexcept
+    : buffers_(std::move(rhs.buffers_)),
+      unowned_indices_(std::move(rhs.unowned_indices_)),
+      dynamic_shape_(std::move(rhs.dynamic_shape_)),
+      host_shape_(std::move(rhs.host_shape_)) {
+  rhs.unowned_indices_.clear();
+}
+
 absl::Status ExecutionInput::SetDynamicShape(Shape dynamic_shape) {
   const Shape& input_shape = shape();
   if (!ShapeUtil::DynamicShapeIsCompatible(input_shape, dynamic_shape)) {
-    return tsl::errors::InvalidArgument(
-        "Cannot set dynamic shape: ", input_shape.ToString(), " vs. ",
-        dynamic_shape.ToString());
+    return absl::InvalidArgumentError(
+        absl::StrCat("Cannot set dynamic shape: ", input_shape.ToString(),
+                     " vs. ", dynamic_shape.ToString()));
   }
   dynamic_shape_ = std::make_unique<Shape>(std::move(dynamic_shape));
   return absl::OkStatus();
 }
 
 void ExecutionInput::SetUnownedBuffer(const ShapeIndex& index,
-                                      MaybeOwningDeviceMemory buffer) {
+                                      MaybeOwningDeviceAddress buffer) {
   *buffers_.mutable_element(index) = std::move(buffer);
   unowned_indices_.insert(index);
 }
@@ -66,17 +82,17 @@ absl::StatusOr<ScopedShapedBuffer> Executable::ExecuteOnStream(
   absl::StatusOr<ScopedShapedBuffer> result =
       ExecuteAsyncOnStream(run_options, arguments);
   absl::Status blocking_status = run_options->stream()->BlockHostUntilDone();
-  TF_RETURN_IF_ERROR(result.status());
-  TF_RETURN_IF_ERROR(blocking_status);
+  RETURN_IF_ERROR(result.status());
+  RETURN_IF_ERROR(blocking_status);
   return result;
 }
 
-static ExecutionInput MakeMaybeOwningDeviceMemoryTree(
+static ExecutionInput MakeMaybeOwningDeviceAddressTree(
     const ShapedBuffer& shaped_buffer) {
   ExecutionInput result(shaped_buffer.on_device_shape());
   shaped_buffer.buffers().ForEachElement(
-      [&](const ShapeIndex& index, const se::DeviceMemoryBase& mem) {
-        result.SetBuffer(index, MaybeOwningDeviceMemory(mem));
+      [&](const ShapeIndex& index, const se::DeviceAddressBase& mem) {
+        result.SetBuffer(index, MaybeOwningDeviceAddress(mem));
       });
   return result;
 }
@@ -87,10 +103,10 @@ absl::StatusOr<ScopedShapedBuffer> Executable::ExecuteAsyncOnStream(
   std::vector<ExecutionInput> args;
   args.reserve(arguments.size());
   for (const ShapedBuffer* arg : arguments) {
-    args.emplace_back(MakeMaybeOwningDeviceMemoryTree(*arg));
+    args.emplace_back(MakeMaybeOwningDeviceAddressTree(*arg));
   }
-  TF_ASSIGN_OR_RETURN(ExecutionOutput out,
-                      ExecuteAsyncOnStream(run_options, std::move(args)));
+  ASSIGN_OR_RETURN(ExecutionOutput out,
+                   ExecuteAsyncOnStream(run_options, std::move(args)));
   return out.ConsumeResult();
 }
 
@@ -100,8 +116,8 @@ absl::StatusOr<ExecutionOutput> Executable::ExecuteOnStream(
   absl::StatusOr<ExecutionOutput> result =
       ExecuteAsyncOnStream(run_options, std::move(arguments));
   absl::Status blocking_status = run_options->stream()->BlockHostUntilDone();
-  TF_RETURN_IF_ERROR(result.status());
-  TF_RETURN_IF_ERROR(blocking_status);
+  RETURN_IF_ERROR(result.status());
+  RETURN_IF_ERROR(blocking_status);
   return result;
 }
 
@@ -114,8 +130,7 @@ absl::StatusOr<std::vector<ScopedShapedBuffer>> Executable::ExecuteOnStreams(
   return_values.reserve(run_options.size());
 
   if (run_options.size() == 1) {
-    TF_ASSIGN_OR_RETURN(auto rv,
-                        ExecuteOnStream(&run_options[0], arguments[0]));
+    ASSIGN_OR_RETURN(auto rv, ExecuteOnStream(&run_options[0], arguments[0]));
     return_values.push_back(std::move(rv));
     return std::move(return_values);
   }
@@ -124,13 +139,13 @@ absl::StatusOr<std::vector<ScopedShapedBuffer>> Executable::ExecuteOnStreams(
     // We cannot BlockHostUntilDone() on the already-launched executions in case
     // of error, since if the executions communicate, the initially launched
     // executions may never complete if not all executions are running.
-    TF_ASSIGN_OR_RETURN(auto rv,
-                        ExecuteAsyncOnStream(&run_options[i], arguments[i]));
+    ASSIGN_OR_RETURN(auto rv,
+                     ExecuteAsyncOnStream(&run_options[i], arguments[i]));
     return_values.push_back(std::move(rv));
   }
   for (const auto& options : run_options) {
     TF_RET_CHECK(options.stream() != nullptr);
-    TF_RETURN_IF_ERROR(options.stream()->BlockHostUntilDone());
+    RETURN_IF_ERROR(options.stream()->BlockHostUntilDone());
   }
   return std::move(return_values);
 }
@@ -141,8 +156,8 @@ absl::StatusOr<ScopedShapedBuffer> Executable::ExecuteOnStreamWrapper(
   absl::StatusOr<ScopedShapedBuffer> result =
       ExecuteAsyncOnStreamWrapper(run_options, arguments);
   absl::Status block_status = run_options->stream()->BlockHostUntilDone();
-  TF_RETURN_IF_ERROR(result.status());
-  TF_RETURN_IF_ERROR(block_status);
+  RETURN_IF_ERROR(result.status());
+  RETURN_IF_ERROR(block_status);
   return result;
 }
 
@@ -152,8 +167,8 @@ absl::StatusOr<ExecutionOutput> Executable::ExecuteOnStreamWrapper(
   absl::StatusOr<ExecutionOutput> result =
       ExecuteAsyncOnStreamWrapper(run_options, std::move(arguments));
   absl::Status block_status = run_options->stream()->BlockHostUntilDone();
-  TF_RETURN_IF_ERROR(result.status());
-  TF_RETURN_IF_ERROR(block_status);
+  RETURN_IF_ERROR(result.status());
+  RETURN_IF_ERROR(block_status);
   return result;
 }
 
@@ -187,7 +202,7 @@ absl::Status ExecuteWrapperAfterExecution(
   if (state.profile != nullptr) {
     // We block instead of using an async callback because reading the timer
     // value may call back into the driver on GPU, which is not allowed.
-    TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+    RETURN_IF_ERROR(stream->BlockHostUntilDone());
 
     const int64_t executable_size_in_bytes =
         executable->SizeOfGeneratedCodeInBytes();
@@ -216,7 +231,7 @@ absl::StatusOr<ScopedShapedBuffer> Executable::ExecuteAsyncOnStreamWrapper(
   auto state = ExecuteWrapperBeforeExecution(*this, run_options);
   absl::StatusOr<ScopedShapedBuffer> return_value =
       ExecuteAsyncOnStream(run_options, arguments);
-  TF_RETURN_IF_ERROR(ExecuteWrapperAfterExecution(
+  RETURN_IF_ERROR(ExecuteWrapperAfterExecution(
       this, state, return_value.status(), run_options->stream()));
   return return_value;
 }
@@ -227,7 +242,7 @@ absl::StatusOr<ExecutionOutput> Executable::ExecuteAsyncOnStreamWrapper(
   auto state = ExecuteWrapperBeforeExecution(*this, run_options);
   absl::StatusOr<ExecutionOutput> return_value =
       ExecuteAsyncOnStream(run_options, std::move(arguments));
-  TF_RETURN_IF_ERROR(ExecuteWrapperAfterExecution(
+  RETURN_IF_ERROR(ExecuteWrapperAfterExecution(
       this, state, return_value.status(), run_options->stream()));
   return return_value;
 }
@@ -238,7 +253,7 @@ void Executable::MarkToBeReleasedArguments(absl::Span<ExecutionInput> arguments,
                                            ExecutionOutput& result) {
   for (ExecutionInput& argument : arguments) {
     for (auto& index_buffer : *argument.MutableBuffers()) {
-      if (std::optional<se::OwningDeviceMemory> maybe_owning_buffer =
+      if (std::optional<se::ScopedDeviceAddress<uint8_t>> maybe_owning_buffer =
               index_buffer.second.Release()) {
         result.AddToBeReleased(std::move(*maybe_owning_buffer));
       }

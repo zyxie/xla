@@ -32,8 +32,10 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/comparison_util.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/builder/padding.h"
@@ -46,6 +48,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/pattern_matcher_gmock.h"
@@ -57,10 +60,9 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/tuple_tree.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/status_matchers.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -70,8 +72,8 @@ namespace m = ::xla::match;
 
 using ::testing::_;
 using ::testing::HasSubstr;
+using ::testing::Property;
 using ::testing::Test;
-using ::tsl::testing::StatusIs;
 
 HloInstruction* GetRoot(HloModule& module) {
   return module.entry_computation()->root_instruction();
@@ -79,24 +81,22 @@ HloInstruction* GetRoot(HloModule& module) {
 
 // TODO(b/74197823): Move the tests to service/.
 absl::StatusOr<std::unique_ptr<HloModule>> BuildHloModule(XlaBuilder& b) {
-  TF_ASSIGN_OR_RETURN(XlaComputation computation,
-                      b.Build(/*remove_dynamic_dimensions=*/false));
+  ASSIGN_OR_RETURN(XlaComputation computation,
+                   b.Build(/*remove_dynamic_dimensions=*/false));
   const HloModuleProto& proto = computation.proto();
-  TF_ASSIGN_OR_RETURN(const auto& config,
-                      HloModule::CreateModuleConfigFromProto(
-                          proto, GetDebugOptionsFromFlags()));
+  ASSIGN_OR_RETURN(const auto& config, HloModule::CreateModuleConfigFromProto(
+                                           proto, GetDebugOptionsFromFlags()));
   return HloModule::CreateFromProto(proto, config);
 }
 
 // Overload which explicitly specifies the root instruction.
 absl::StatusOr<std::unique_ptr<HloModule>> BuildHloModule(XlaBuilder& b,
                                                           XlaOp root) {
-  TF_ASSIGN_OR_RETURN(XlaComputation computation,
-                      b.Build(root, /*remove_dynamic_dimensions=*/false));
+  ASSIGN_OR_RETURN(XlaComputation computation,
+                   b.Build(root, /*remove_dynamic_dimensions=*/false));
   const HloModuleProto& proto = computation.proto();
-  TF_ASSIGN_OR_RETURN(const auto& config,
-                      HloModule::CreateModuleConfigFromProto(
-                          proto, GetDebugOptionsFromFlags()));
+  ASSIGN_OR_RETURN(const auto& config, HloModule::CreateModuleConfigFromProto(
+                                           proto, GetDebugOptionsFromFlags()));
   return HloModule::CreateFromProto(proto, config);
 }
 
@@ -1026,6 +1026,40 @@ TEST(XlaBuilderTest, ReportError) {
   EXPECT_THAT(statusor.status().message(), HasSubstr("a test error"));
 }
 
+TEST(XlaBuilderTest, ReportErrorWithPythonLocation) {
+  XlaBuilder b(TestName());
+  OpMetadata metadata;
+  metadata.set_source_file("test_file.py");
+  metadata.set_source_line(42);
+  b.SetOpMetadata(metadata);
+
+  auto x = Parameter(&b, 0, ShapeUtil::MakeShape(F32, {5, 7}), "x");
+  Add(b.ReportError(InvalidArgument("a test error")), x);
+  auto statusor = b.Build();
+  ASSERT_FALSE(statusor.ok());
+  EXPECT_THAT(statusor.status().message(), HasSubstr("a test error"));
+  EXPECT_THAT(statusor.status().message(), HasSubstr("Python Code Location:"));
+  EXPECT_THAT(statusor.status().message(), HasSubstr("File: test_file.py:42"));
+}
+
+TEST(XlaBuilderTest, ReportErrorWithOneShotPythonLocation) {
+  XlaBuilder b(TestName());
+  auto x = Parameter(&b, 0, ShapeUtil::MakeShape(F32, {5, 7}), "x");
+
+  OpMetadata metadata;
+  metadata.set_source_file("test_file_oneshot.py");
+  metadata.set_source_line(84);
+  b.SetOneShotOpMetadata(metadata);
+
+  Add(b.ReportError(InvalidArgument("a test error")), x);
+  auto statusor = b.Build();
+  ASSERT_FALSE(statusor.ok());
+  EXPECT_THAT(statusor.status().message(), HasSubstr("a test error"));
+  EXPECT_THAT(statusor.status().message(), HasSubstr("Python Code Location:"));
+  EXPECT_THAT(statusor.status().message(),
+              HasSubstr("File: test_file_oneshot.py:84"));
+}
+
 TEST(XlaBuilderTest, ReportErrorOrReturnHandlesNonErrors) {
   XlaBuilder b(TestName());
   absl::StatusOr<XlaOp> op(ConstantR0<float>(&b, 1.0));
@@ -1696,31 +1730,6 @@ TEST(XlaBuilderTest, FftWithIRFFT) {
               GmockMatch(m::Op().WithShapeEqualTo(&expected)));
 }
 
-TEST(XlaBuilderTest, SparseDot) {
-  XlaBuilder b(TestName());
-  auto lhs = Parameter(&b, 0, ShapeUtil::MakeShape(F32, {10, 16}), "lhs");
-  auto rhs = Parameter(&b, 1, ShapeUtil::MakeShape(F32, {32, 20}), "rhs");
-  auto meta = Parameter(&b, 2, ShapeUtil::MakeShape(U16, {10, 2}), "meta");
-
-  DotDimensionNumbers dnums;
-  dnums.add_lhs_contracting_dimensions(1);
-  dnums.add_rhs_contracting_dimensions(0);
-  SparsityDescriptor sparsity_descriptor;
-  sparsity_descriptor.set_type(SparsityType::SPARSITY_STRUCTURED_N_M);
-  sparsity_descriptor.set_n(2);
-  sparsity_descriptor.set_m(4);
-  sparsity_descriptor.set_index(0);
-  sparsity_descriptor.set_dimension(1);
-  std::vector<SparsityDescriptor> sparsity = {sparsity_descriptor};
-  std::vector<XlaOp> sparse_meta = {meta};
-
-  SparseDot(lhs, rhs, sparse_meta, sparsity, dnums);
-  TF_ASSERT_OK_AND_ASSIGN(const auto module, BuildHloModule(b));
-  TF_ASSERT_OK_AND_ASSIGN(const Shape expected, ParseShape("f32[10, 20]"));
-  EXPECT_THAT(GetRoot(*module),
-              GmockMatch(m::Op().WithShapeEqualTo(&expected)));
-}
-
 TEST(XlaBuilderTest, RaggedDotNonContractingWithPreferredElementType) {
   XlaBuilder b(TestName());
   auto lhs = Parameter(&b, 0, ShapeUtil::MakeShape(S8, {11, 5}), "lhs");
@@ -2198,9 +2207,9 @@ TEST(XlaBuilderTest, OutfeedTokenSharding) {
   EXPECT_EQ(outfeed->sharding().tuple_elements().size(), 2);
   EXPECT_TRUE(outfeed->operand(1)->has_sharding());
   EXPECT_EQ(outfeed->sharding().tuple_elements().back(),
-            HloSharding::FromProto(sharding_builder::AssignDevice(0)).value());
+            HloSharding::FromProto(sharding_builder::SingleDevice(0)).value());
   EXPECT_EQ(outfeed->operand(1)->sharding(),
-            HloSharding::FromProto(sharding_builder::AssignDevice(0)).value());
+            HloSharding::FromProto(sharding_builder::SingleDevice(0)).value());
 }
 
 TEST(XlaBuilderTest, NormalizeTupleSharding) {
@@ -2361,8 +2370,8 @@ TEST(XlaBuilderTest,
       /*broadcast_dimensions=*/{1, 2}, output_shape);
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr("output_dimensions must be an integer type f32[3]")));
+      absl_testing::StatusIs(
+          _, HasSubstr("output_dimensions must be an integer type f32[3]")));
 }
 
 TEST(XlaBuilderTest, MhloDynamicBroadcastInDimInvalidOutputDimensionsRank) {
@@ -2377,8 +2386,8 @@ TEST(XlaBuilderTest, MhloDynamicBroadcastInDimInvalidOutputDimensionsRank) {
       /*broadcast_dimensions=*/{1, 2}, output_shape);
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr("output_dimensions must be rank 1 but got rank 2")));
+      absl_testing::StatusIs(
+          _, HasSubstr("output_dimensions must be rank 1 but got rank 2")));
 }
 
 TEST(XlaBuilderTest, MhloDynamicBroadcastInDimIncompatibleBroadcastSize) {
@@ -2392,8 +2401,9 @@ TEST(XlaBuilderTest, MhloDynamicBroadcastInDimIncompatibleBroadcastSize) {
       /*broadcast_dimensions=*/{1, 2}, output_shape);
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_, HasSubstr("size of operand dimension 0 (2) is not compatible "
-                            "with size of result dimension 1 (3)")));
+      absl_testing::StatusIs(
+          _, HasSubstr("size of operand dimension 0 (2) is not compatible "
+                       "with size of result dimension 1 (3)")));
 }
 
 TEST(XlaBuilderTest, MhloDynamicReshapeExportSuccess) {
@@ -2422,8 +2432,9 @@ TEST(XlaBuilderTest, MhloDynamicReshapeIncompatibleElementType) {
       /*output_shape=*/Parameter(&b, 1, output_shape, "output_shape"),
       /*shape=*/shape);
   EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("Element type of operand f32[?,15] and "
-                                    "output s32[?,15] must match")));
+              absl_testing::StatusIs(
+                  _, HasSubstr("Element type of operand f32[?,15] and "
+                               "output s32[?,15] must match")));
 }
 
 TEST(XlaBuilderTest, MhloDynamicReshapeElementCountMismatch) {
@@ -2435,10 +2446,11 @@ TEST(XlaBuilderTest, MhloDynamicReshapeElementCountMismatch) {
       /*operand=*/Parameter(&b, 0, operand, "operand"),
       /*output_shape=*/Parameter(&b, 1, output_shape, "output_shape"),
       /*shape=*/shape);
-  EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("MhloDynamicReshape has mismatched "
-                                    "element counts: from=45 (f32[3,15]) "
-                                    "to=60 (f32[4,15])")));
+  EXPECT_THAT(
+      BuildHloModule(b),
+      absl_testing::StatusIs(_, HasSubstr("MhloDynamicReshape has mismatched "
+                                          "element counts: from=45 (f32[3,15]) "
+                                          "to=60 (f32[4,15])")));
 }
 
 TEST(XlaBuilderTest, MhloDynamicReshapeRankMismatch) {
@@ -2452,8 +2464,9 @@ TEST(XlaBuilderTest, MhloDynamicReshapeRankMismatch) {
       /*shape=*/shape);
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_, HasSubstr("output_shape dimension size=3 (s32[3]) and rank "
-                            "of shape=2 (f32[?,15]) must match")));
+      absl_testing::StatusIs(
+          _, HasSubstr("output_shape dimension size=3 (s32[3]) and rank "
+                       "of shape=2 (f32[?,15]) must match")));
 }
 
 TEST(XlaBuilderTest, ConvertSpmdShardToFullShape) {
@@ -2549,7 +2562,8 @@ TEST_P(XlaBuilderUnboundedBinaryOpTest, UnboundedBinaryOpTest) {
                 GmockMatch(m::Op().WithShapeEqualTo(&expected)));
   } else {
     ASSERT_TRUE(GetParam().error_message.has_value());
-    EXPECT_THAT(result, StatusIs(_, HasSubstr(*GetParam().error_message)));
+    EXPECT_THAT(result, absl_testing::StatusIs(
+                            _, HasSubstr(*GetParam().error_message)));
   }
 }
 
@@ -2584,8 +2598,9 @@ TEST(XlaBuilderTest, UnboundedAddUnsupportedImplicitBroadcast) {
   TF_ASSERT_OK_AND_ASSIGN(const Shape expected, ParseShape("f32[?, 10]"));
   Add(Parameter(&b, 0, lhs, "lhs"), Parameter(&b, 1, rhs, "rhs"),
       /*broadcast_dimensions=*/zero_array);
-  EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr(kBroadcastDimensionMismatch)));
+  EXPECT_THAT(
+      BuildHloModule(b),
+      absl_testing::StatusIs(_, HasSubstr(kBroadcastDimensionMismatch)));
 }
 
 TEST(XlaBuilderTest, UnboundedAllGather) {
@@ -2691,9 +2706,9 @@ TEST(XlaBuilderTest, UnboundedAllToAllTupleVariadicUnsupported) {
                     /*replica_groups=*/{}));
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr(
-                   "AllToAllTuple does not support unbounded dynamic shapes")));
+      absl_testing::StatusIs(
+          _, HasSubstr(
+                 "AllToAllTuple does not support unbounded dynamic shapes")));
 }
 
 TEST(XlaBuilderTest, UnboundedAllToAllTupleUnsupported) {
@@ -2707,9 +2722,9 @@ TEST(XlaBuilderTest, UnboundedAllToAllTupleUnsupported) {
                     /*replica_groups=*/{}));
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr(
-                   "AllToAllTuple does not support unbounded dynamic shapes")));
+      absl_testing::StatusIs(
+          _, HasSubstr(
+                 "AllToAllTuple does not support unbounded dynamic shapes")));
 }
 
 TEST(XlaBuilderTest, BoundedAllToAllTupleUnsupported) {
@@ -2723,8 +2738,8 @@ TEST(XlaBuilderTest, BoundedAllToAllTupleUnsupported) {
                     /*replica_groups=*/{}));
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr("AllToAll does not support bounded dynamic shapes")));
+      absl_testing::StatusIs(
+          _, HasSubstr("AllToAll does not support bounded dynamic shapes")));
 }
 
 TEST(XlaBuilderTest, BoundedAllToAllUnsupported) {
@@ -2738,8 +2753,8 @@ TEST(XlaBuilderTest, BoundedAllToAllUnsupported) {
                     /*replica_groups=*/{}));
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr("AllToAll does not support bounded dynamic shapes")));
+      absl_testing::StatusIs(
+          _, HasSubstr("AllToAll does not support bounded dynamic shapes")));
 }
 
 TEST(XlaBuilderTest, UnboundedAnd) {
@@ -2828,7 +2843,7 @@ TEST(XlaBuilderTest, UnboundedBroadcastUnsupportedOperand) {
   TF_ASSERT_OK_AND_ASSIGN(const Shape operand, ParseShape("f32[<=3, ?]"));
   Broadcast(Parameter(&b, 0, operand, "operand"), /*broadcast_sizes=*/{1});
   EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("is_unbounded_dynamic")));
+              absl_testing::StatusIs(_, HasSubstr("is_unbounded_dynamic")));
 }
 
 TEST(XlaBuilderTest, UnboundedBroadcastUnsupportedBroadcastSize) {
@@ -2838,7 +2853,8 @@ TEST(XlaBuilderTest, UnboundedBroadcastUnsupportedBroadcastSize) {
             /*broadcast_sizes=*/{Shape::kUnboundedSize});
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_, HasSubstr("Non-broadcast dimensions must not be dynamic.")));
+      absl_testing::StatusIs(
+          _, HasSubstr("Non-broadcast dimensions must not be dynamic.")));
 }
 
 TEST(XlaBuilderTest, UnboundedBroadcastInDim) {
@@ -2859,9 +2875,10 @@ TEST(XlaBuilderTest, UnboundedBroadcastInDimUnsupported) {
   BroadcastInDim(Parameter(&b, 0, operand, "operand"),
                  /*out_dim_size=*/{2, 3, Shape::kUnboundedSize},
                  /*broadcast_dimensions=*/{0, 2});
-  EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("BroadcastInDim output must shape be "
-                                    "static or bounded dynamic")));
+  EXPECT_THAT(
+      BuildHloModule(b),
+      absl_testing::StatusIs(_, HasSubstr("BroadcastInDim output must shape be "
+                                          "static or bounded dynamic")));
 }
 
 TEST(XlaBuilderTest, UnboundedCall) {
@@ -2976,7 +2993,8 @@ TEST(XlaBuilderTest,
   Clamp(Parameter(&b, 0, lhs, "lhs"), Parameter(&b, 1, rhs, "rhs"),
         Parameter(&b, 2, ehs, "ehs"));
   EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("Unimplemented implicit broadcast.")));
+              absl_testing::StatusIs(
+                  _, HasSubstr("Unimplemented implicit broadcast.")));
 }
 
 TEST(XlaBuilderTest, UnboundedCollectiveBroadcast) {
@@ -3472,9 +3490,9 @@ TEST(XlaBuilderTest, UnboundedReshapeUnsupportedOutputShape) {
           /*dimensions=*/{Shape::kUnboundedSize, Shape::kUnboundedSize});
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr(
-                   "Reshaping with unbounded result shape is not supported.")));
+      absl_testing::StatusIs(
+          _, HasSubstr(
+                 "Reshaping with unbounded result shape is not supported.")));
 }
 
 TEST(XlaBuilderTest, UnboundedReshapeUnsupportedInferredShape) {
@@ -3483,9 +3501,9 @@ TEST(XlaBuilderTest, UnboundedReshapeUnsupportedInferredShape) {
   Reshape(operand, Parameter(&b, 0, operand, "operand"));
   EXPECT_THAT(
       BuildHloModule(b),
-      StatusIs(_,
-               HasSubstr(
-                   "Reshaping with unbounded result shape is not supported.")));
+      absl_testing::StatusIs(
+          _, HasSubstr(
+                 "Reshaping with unbounded result shape is not supported.")));
 }
 
 TEST(XlaBuilderTest, UnboundedReverse) {
@@ -3652,7 +3670,8 @@ TEST(XlaBuilderTest,
   Select(Parameter(&b, 0, lhs, "lhs"), Parameter(&b, 1, rhs, "rhs"),
          Parameter(&b, 2, ehs, "ehs"));
   EXPECT_THAT(BuildHloModule(b),
-              StatusIs(_, HasSubstr("Unimplemented implicit broadcast.")));
+              absl_testing::StatusIs(
+                  _, HasSubstr("Unimplemented implicit broadcast.")));
 }
 
 TEST(XlaBuilderTest, UnboundedSelectAndScatter) {
@@ -4010,7 +4029,7 @@ TEST(XlaBuilderTest, InfeedTokenSharding) {
   TF_ASSERT_OK_AND_ASSIGN(const auto module, BuildHloModule(b));
   TF_ASSERT_OK_AND_ASSIGN(
       const auto token_sharding,
-      HloSharding::FromProto(sharding_builder::AssignDevice(0)));
+      HloSharding::FromProto(sharding_builder::SingleDevice(0)));
   for (const HloInstruction* instruction :
        module->entry_computation()->instructions()) {
     if (instruction->shape().IsToken()) {
@@ -4018,6 +4037,110 @@ TEST(XlaBuilderTest, InfeedTokenSharding) {
       EXPECT_EQ(instruction->sharding(), token_sharding);
     }
   }
+}
+
+TEST(XlaBuilderTest, InstructionNameFromMetadata) {
+  XlaBuilder b(TestName());
+  OpMetadata metadata;
+  metadata.set_op_name("jit(fn)/sin");
+  XlaScopedOpMetadataAssignment op_metadata(&b, metadata);
+  ConstantR0<float>(&b, 1.0f);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto module, BuildHloModule(b));
+  HloInstruction* constant = module->entry_computation()->root_instruction();
+  EXPECT_EQ(constant->name().substr(0, constant->name().find_first_of('.')),
+            "sin");
+}
+
+TEST(XlaBuilderTest, InstructionNameFromMetadataWithDot) {
+  XlaBuilder b(TestName());
+  OpMetadata metadata;
+  metadata.set_op_name("inputs.x");
+  XlaScopedOpMetadataAssignment op_metadata(&b, metadata);
+  ConstantR0<float>(&b, 1.0f);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto module, BuildHloModule(b));
+  HloInstruction* constant = module->entry_computation()->root_instruction();
+  EXPECT_EQ(constant->name().substr(0, constant->name().find_first_of('.')),
+            "inputs_x");
+}
+
+TEST(XlaBuilderTest, BuildProtoWritesFullRootId) {
+  XlaBuilder b_root(TestName());
+
+  auto b_call = b_root.CreateSubBuilder("the_only_to_apply");
+  auto p0 = Parameter(b_call.get(), 0, ShapeUtil::MakeShape(F32, {}), "p0");
+  auto p1 = Parameter(b_call.get(), 1, ShapeUtil::MakeShape(F32, {}), "p1");
+  Add(p0, p1);
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputationId call, b_call->BuildSubComputation());
+
+  std::unique_ptr<XlaBuilder> b = b_root.CreateSubBuilder("main");
+
+  auto x = Parameter(b.get(), 0, ShapeUtil::MakeShape(F32, {}), "x");
+  auto y = Parameter(b.get(), 1, ShapeUtil::MakeShape(F32, {}), "y");
+  auto one = ConstantR0<float>(b.get(), 1);
+  auto two = ConstantR0<float>(b.get(), 2);
+  Add(Call(b.get(), call, {x, y}), Call(b.get(), call, {one, two}));
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputationId main, b->BuildSubComputation());
+
+  TF_ASSERT_OK_AND_ASSIGN(XlaComputation computation, b_root.Build(main));
+  const HloModuleProto& proto = computation.proto();
+
+  EXPECT_EQ(proto.computations_size(), 2);
+  // Root ids should be full unique ids and match the unique id of an
+  // instruction.
+  for (const HloComputationProto& computation_proto : proto.computations()) {
+    EXPECT_THAT(computation_proto.instructions(),
+                Contains(Property(
+                    &HloInstructionProto::id,
+                    HloInstruction::CalculateUniqueId(
+                        computation_proto.id(), computation_proto.root_id()))));
+  }
+}
+
+TEST(XlaBuilderTest, OriginalValue) {
+  XlaBuilder b(TestName());
+  auto create_parameter_with_original_value =
+      [&b](int64_t index, const Shape& shape, const std::string& param_name,
+           const xla::OriginalArray& original_array) {
+        auto original_value = std::make_shared<xla::OriginalValue>(shape);
+        original_value->mutable_tree()->begin()->second = original_array;
+        b.SetOriginalValue(original_value->ToProto());
+        return Parameter(&b, index, shape, param_name);
+      };
+
+  TF_ASSERT_OK_AND_ASSIGN(const Shape shape0, ParseShape("f32[2, 4]"));
+  auto original_array0 = xla::OriginalArray{"x", {}};
+  auto param0 = create_parameter_with_original_value(0, shape0, "param0",
+                                                     original_array0);
+
+  TF_ASSERT_OK_AND_ASSIGN(const Shape shape1, ParseShape("f32[2, 4]"));
+  auto original_array1 = xla::OriginalArray{"y", {}};
+  auto param1 = create_parameter_with_original_value(1, shape1, "param1",
+                                                     original_array1);
+
+  GetTupleElement(Tuple(&b, {param0, param1}), 1);
+  TF_ASSERT_OK_AND_ASSIGN(const std::unique_ptr<xla::HloModule> module,
+                          BuildHloModule(b));
+
+  HloInstruction* gte = GetRoot(*module);
+  EXPECT_THAT(gte->opcode(), HloOpcode::kGetTupleElement);
+  xla::OriginalValue expected_gte_original_value(
+      TupleTree<std::optional<xla::OriginalArray>>::Node::Leaf(
+          original_array1));
+  std::shared_ptr<xla::OriginalValue> gte_original_value =
+      gte->original_value();
+  EXPECT_NE(gte_original_value, nullptr);
+  EXPECT_THAT(*gte_original_value, expected_gte_original_value);
+
+  const HloInstruction* tuple = gte->operand(0);
+  EXPECT_THAT(tuple->opcode(), HloOpcode::kTuple);
+  std::shared_ptr<xla::OriginalValue> tuple_original_value =
+      tuple->original_value();
+  xla::OriginalValue expected_tuple_original_value(
+      {original_array0, original_array1});
+  EXPECT_NE(tuple_original_value, nullptr);
+  EXPECT_THAT(*tuple_original_value, expected_tuple_original_value);
 }
 
 }  // namespace

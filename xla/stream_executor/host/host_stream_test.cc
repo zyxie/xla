@@ -13,17 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
+#include <vector>
+
 #include <gtest/gtest.h>
-#include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
-#include "tsl/platform/test.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace se = stream_executor;
 
@@ -37,7 +38,7 @@ TEST(HostStream, EnforcesFIFOOrder) {
   bool ok = true;
   for (int i = 0; i < 2000; ++i) {
     TF_ASSERT_OK(stream->DoHostCallback([i, &mu, &expected, &ok]() {
-      absl::MutexLock lock(&mu);
+      absl::MutexLock lock(mu);
       if (expected != i) {
         ok = false;
       }
@@ -45,33 +46,27 @@ TEST(HostStream, EnforcesFIFOOrder) {
     }));
   }
   TF_ASSERT_OK(stream->BlockHostUntilDone());
-  absl::MutexLock lock(&mu);
+  absl::MutexLock lock(mu);
   EXPECT_TRUE(ok);
 }
 
-TEST(HostStream, ReportsHostCallbackError) {
-  se::Platform* platform =
-      se::PlatformManager::PlatformWithName("Host").value();
-  se::StreamExecutor* executor = platform->ExecutorForDevice(0).value();
+TEST(HostStream, Memset32) {
+  TF_ASSERT_OK_AND_ASSIGN(se::Platform * platform,
+                          se::PlatformManager::PlatformWithName("Host"));
+  TF_ASSERT_OK_AND_ASSIGN(se::StreamExecutor * executor,
+                          platform->ExecutorForDevice(0));
   TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
-  TF_ASSERT_OK(stream->DoHostCallbackWithStatus(
-      []() { return absl::InternalError("error!"); }));
 
-  auto status = stream->BlockHostUntilDone();
-  ASSERT_EQ(status.code(), tsl::error::INTERNAL);
-  ASSERT_EQ(status.message(), "error!");
-}
+  uint32_t pattern = 0x12345678;
+  std::vector<uint32_t> buffer(4, 0);
+  se::DeviceAddressBase location(buffer.data(),
+                                 buffer.size() * sizeof(uint32_t));
 
-TEST(HostStream, ReportsFirstHostCallbackError) {
-  se::Platform* platform =
-      se::PlatformManager::PlatformWithName("Host").value();
-  se::StreamExecutor* executor = platform->ExecutorForDevice(0).value();
-  TF_ASSERT_OK_AND_ASSIGN(auto stream, executor->CreateStream());
-  TF_ASSERT_OK(stream->DoHostCallbackWithStatus(
-      []() { return absl::InternalError("error 1"); }));
-  TF_ASSERT_OK(stream->DoHostCallbackWithStatus(
-      []() { return absl::InternalError("error 2"); }));
+  TF_ASSERT_OK(
+      stream->Memset32(&location, pattern, buffer.size() * sizeof(uint32_t)));
+  TF_ASSERT_OK(stream->BlockHostUntilDone());
 
-  // "error 2" is just lost.
-  ASSERT_EQ(stream->BlockHostUntilDone().message(), "error 1");
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(buffer[i], pattern);
+  }
 }

@@ -15,13 +15,21 @@ limitations under the License.
 
 #include "xla/stream_executor/cuda/ptx_compiler_helpers.h"
 
+#include <string>
+#include <vector>
+
 #include "absl/base/call_once.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
-#include "xla/stream_executor/device_description.h"
+#include "re2/re2.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/kernel_stats.h"
 #include "xla/stream_executor/semantic_version.h"
 
 namespace stream_executor {
@@ -47,6 +55,64 @@ bool IsPtxRegisterAllocationError(absl::string_view str) {
           absl::StrContains(str, "Insufficient registers"));
 }
 
+absl::StatusOr<int> GetLatestPtxIsaVersionFromUnsupportedVersionErrorLog(
+    absl::string_view error_log) {
+  std::vector<absl::string_view> chunks = absl::StrSplit(error_log, '\'');
+  if (chunks.size() != 3) {
+    return absl::InternalError(absl::StrCat(
+        "Failed to locate PTX ISA version in ptxas error message: ",
+        error_log));
+  }
+  std::vector<std::string> major_minor = absl::StrSplit(chunks[1], '.');
+  if (major_minor.size() != 2) {
+    return absl::InternalError(
+        absl::StrFormat("Expected PTX ISA version to be formatted as "
+                        "MAJOR.MINOR, instead got: %s",
+                        chunks[1]));
+  }
+  int major;
+  if (!absl::SimpleAtoi(major_minor[0], &major)) {
+    return absl::InternalError(
+        absl::StrFormat("Failed to parse PTX ISA major version, expected a "
+                        "parsable integer, instead got: %s",
+                        major_minor[0]));
+  }
+  int minor;
+  if (!absl::SimpleAtoi(major_minor[1], &minor)) {
+    return absl::InternalError(
+        absl::StrFormat("Failed to parse PTX ISA minor version, expected a "
+                        "parsable integer, instead got: %s",
+                        major_minor[1]));
+  }
+  if (minor >= 10) {
+    return absl::InternalError(
+        absl::StrFormat("PTX ISA minor version %d is not less than or equal to "
+                        "9, which is assumed for version comparison",
+                        minor));
+  }
+  return major * 10 + minor;
+}
+
+ModuleStats ExtractModuleStatsFromLog(absl::string_view log) {
+  // Reads the log for registers spilled and adds up the count. An example of
+  // this line is:
+  // "Registers are spilled to local memory in function 'rr', 1080 bytes spill
+  // stores, 968 bytes spill loads"
+  static constexpr LazyRE2 kSpillRegex{
+      R"(function\s+'(\w+)',\s*(\d+)\s+bytes\s+spill\s+stores,\s*(\d+)\s+bytes\s+spill\s+loads)"};
+  ModuleStats kernel_stats_map;
+
+  int spill_stores = 0;
+  int spill_loads = 0;
+  std::string function_name;
+  absl::string_view search_log = log;
+  while (RE2::FindAndConsume(&search_log, *kSpillRegex, &function_name,
+                             &spill_stores, &spill_loads)) {
+    kernel_stats_map[function_name] = {spill_stores, spill_loads};
+  }
+  return kernel_stats_map;
+}
+
 absl::Status CreateErrorFromPTXASLog(absl::string_view log,
                                      absl::string_view architecture,
                                      bool cancel_if_reg_spill) {
@@ -70,6 +136,9 @@ absl::Status CreateErrorFromPTXASLog(absl::string_view log,
           "Compilation result discarded due to register spilling");
     }
   }
+  if (absl::StrContains(log, "Undefined reference to")) {
+    return absl::UnknownError(absl::StrCat("Compiler error:", log));
+  }
   return absl::OkStatus();
 }
 
@@ -91,23 +160,14 @@ void WarnIfBadPtxasVersion(absl::string_view method,
           << ", which corresponds to a CUDA version <=12.6.2. CUDA versions "
              "12.x.y up to and including 12.6.2 miscompile certain edge "
              "cases around clamping.\nPlease upgrade to CUDA 12.6.3 or newer.";
-      if (method != "ptxas" && compiler_version.major() == 12 &&
-          compiler_version.minor() == 6) {
+      if (method != "ptxas" && compiler_version.major_version() == 12 &&
+          compiler_version.minor_version() == 6) {
         LOG(ERROR) << "(Note that this warning may be shown spuriously for "
                       "CUDA 12.6.y, since "
                    << method << " does not report patch versions.)";
       }
     }
   });
-}
-
-// Extension is used for compute capabilities 9.0, 10.0/10.1/10.3 and 12.0/12.1
-// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#ptx-compatibility
-bool ShouldUsePtxExtension(const CudaComputeCapability& cc) {
-  return (cc.major == 9 && cc.minor == 0) ||
-         (cc.major == 10 &&
-          (cc.minor == 0 || cc.minor == 1 || cc.minor == 3)) ||
-         (cc.major == 12 && (cc.minor == 0 || cc.minor == 1));
 }
 
 }  // namespace stream_executor

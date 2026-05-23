@@ -7,8 +7,8 @@ def repo():
 
     # Attention: tools parse and update these lines.
     # LINT.IfChange
-    ABSL_COMMIT = "d9e4955c65cd4367dd6bf46f4ccb8cd3d100540b"  # LTS 20250127.1
-    ABSL_SHA256 = "c397cd9cca3f71724a8ddf183e7fa71c19196eaafd1dc2a3c86d3a572613a807"
+    ABSL_COMMIT = "255c84dadd029fd8ad25c5efb5933e47beaa00c7"  # LTS 20260107.1
+    ABSL_SHA256 = "87e91fb785a2d0233f4599317afd576b7736e6732d557bdcdfdc11990bd333ef"
     # LINT.ThenChange(//tensorflow/lite/tools/cmake/modules/abseil-cpp.cmake)
 
     tf_http_archive(
@@ -19,12 +19,11 @@ def repo():
         patch_file = [
             "//third_party/absl:btree.patch",
             "//third_party/absl:build_dll.patch",
-            "//third_party/absl:nullability_macros.patch",
-            "//third_party/absl:rules_cc.patch",
+            "//third_party/absl:endian.patch",
+            "//third_party/absl:append_and_overwrite.patch",
         ],
-        # @com_google_googletest is now @googletest. Create a mapping to avoid breaking existing
-        # users.
         repo_mapping = {
+            "@google_benchmark": "@com_google_benchmark",
             "@googletest": "@com_google_googletest",
         },
     )

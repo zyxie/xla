@@ -19,18 +19,17 @@ limitations under the License.
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Support/LLVM.h"
-#include "stablehlo/dialect/Register.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/translate/hlo_to_mhlo/hlo_to_mlir_hlo.h"
+#include "xla/hlo/translate/register.h"
 #include "xla/hlo/translate/stablehlo.h"
-#include "xla/mlir_hlo/mhlo/IR/register.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 
@@ -45,8 +44,7 @@ std::string PrintModule(mlir::ModuleOp module) {
 
 void LoadHloDialects(mlir::MLIRContext& context) {
   mlir::DialectRegistry registry;
-  mlir::stablehlo::registerAllDialects(registry);
-  mlir::mhlo::registerAllMhloDialects(registry);
+  xla::RegisterMlirToHloDependentDialects(registry);
   context.appendDialectRegistry(registry);
 }
 
@@ -64,7 +62,7 @@ absl::StatusOr<std::string> ConvertHloToStablehlo(
     xla::HloModule const& hlo_module, bool emit_bytecode) {
   mlir::MLIRContext context;
   LoadHloDialects(context);
-  TF_ASSIGN_OR_RETURN(auto module, ConvertHloToStablehlo(context, &hlo_module));
+  ASSIGN_OR_RETURN(auto module, ConvertHloToStablehlo(context, &hlo_module));
   if (emit_bytecode) return SerializeUsingBytecode(*module);
   return PrintModule(*module);
 }

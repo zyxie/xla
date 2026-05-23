@@ -1,4 +1,6 @@
-load("//xla/tests:build_defs.bzl", "xla_test")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//xla:xla.default.bzl", "xla_cc_test")
+load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -17,12 +19,13 @@ cc_library(
     name = "codegen_backend",
     hdrs = ["codegen_backend.h"],
     deps = [
+        ":backends_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/service:executable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
-        "@tsl//tsl/platform:protobuf",
+        "@com_google_protobuf//:any_cc_proto",
     ],
 )
 
@@ -31,54 +34,91 @@ cc_library(
     srcs = ["autotuner.cc"],
     hdrs = ["autotuner.h"],
     deps = [
+        ":autotuner_cache_interface",
+        ":backends_proto_cc",
         ":codegen_backend",
         ":profiler",
+        "//xla:autotune_results_proto_cc",
+        "//xla:autotuning_proto_cc",
+        "//xla:util",
         "//xla/hlo/ir:hlo",
+        "//xla/pjrt/distributed:key_value_store_interface",
+        "//xla/service:dump",
         "//xla/service:executable",
+        "//xla/service:shaped_buffer",
+        "//xla/service/gpu/autotuning:autotuner_status_key",
+        "//xla/stream_executor:kernel_stats",
+        "//xla/tools:hlo_decomposer_lib",
+        "//xla/tsl/concurrency:future",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
+        "//xla/tsl/util:sorted_range",
+        "//xla/tsl/util/proto:proto_utils",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/functional:function_ref",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:vlog_is_on",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-        "@tsl//tsl/platform:blocking_counter",
+        "@com_google_absl//absl/types:span",
+        "@com_google_protobuf//:any_cc_proto",
+        "@com_google_protobuf//:protobuf",
         "@tsl//tsl/platform:fingerprint",
+        "@tsl//tsl/platform:path",
     ],
 )
 
-xla_test(
+xla_cc_test(
     name = "autotuner_test",
     srcs = ["autotuner_test.cc"],
-    backends = [
-        "a100",
-        "h100",
-        "b200",
-    ],
-    tags = [
-        "no_mac",
-    ],
     deps = [
         ":autotuner",
+        ":autotuner_cache_interface",
+        ":backends_proto_cc",
         ":codegen_backend",
         ":profiler",
+        "//xla:autotune_results_proto_cc",
+        "//xla:autotuning_proto_cc",
         "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla/backends/gpu/runtime:thunk",
+        "//xla/backends/gpu/runtime:thunk_executor",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/pjrt/distributed:key_value_store_interface",
         "//xla/service:executable",
+        "//xla/service:shaped_buffer",
         "//xla/service/gpu:backend_configs_cc",
+        "//xla/service/gpu:gpu_executable",
+        "//xla/stream_executor:device_description",
+        "//xla/stream_executor:kernel_stats",
+        "//xla/tsl/distributed_runtime:call_options",
+        "//xla/tsl/distributed_runtime/coordination:coordination_service_agent",
         "//xla/tsl/platform:env",
-        "//xla/tsl/platform:status_matchers",
-        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "//xla/tsl/testing:temporary_directory",
+        "//xla/tsl/util/proto:parse_text_proto",
+        "//xla/tsl/util/proto:proto_matchers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@com_google_protobuf//:any_cc_proto",
+        "@com_google_protobuf//:protobuf",
+        "@tsl//tsl/platform:path",
+        "@tsl//tsl/platform:protobuf",
     ],
 )
 
@@ -87,8 +127,39 @@ cc_library(
     hdrs = ["profiler.h"],
     deps = [
         "//xla/service:executable",
+        "//xla/service:shaped_buffer",
+        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "autotuner_cache_interface",
+    hdrs = ["autotuner_cache_interface.h"],
+    deps = [
+        ":backends_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+tf_proto_library(
+    name = "backends_proto",
+    srcs = ["backends.proto"],
+)
+
+tf_proto_library(
+    name = "autotuning_proto",
+    srcs = ["autotuning.proto"],
+    deps = [
+        ":backends_proto",
+        "@com_google_protobuf//:any_proto",
+        "@com_google_protobuf//:duration_proto",
     ],
 )

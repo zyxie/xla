@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/debug_options_flags.h"
 #include "xla/service/backend.h"
 #include "xla/service/compiler.h"
@@ -46,10 +47,10 @@ CompileOnlyService::NewService(se::Platform* platform) {
 CompileOnlyService::NewService(const ServiceOptions& options) {
   se::Platform* platform = options.platform();
   if (platform == nullptr) {
-    TF_ASSIGN_OR_RETURN(platform, PlatformUtil::GetDefaultPlatform());
+    ASSIGN_OR_RETURN(platform, PlatformUtil::GetDefaultPlatform());
   }
 
-  TF_ASSIGN_OR_RETURN(auto compiler, Compiler::GetForPlatform(platform));
+  ASSIGN_OR_RETURN(auto compiler, Compiler::GetForPlatform(platform->id()));
 
   std::unique_ptr<CompileOnlyService> service(
       new CompileOnlyService(options, std::move(compiler)));
@@ -61,13 +62,11 @@ CompileOnlyService::CompileOnlyService(const ServiceOptions& options,
     : Service(options, /*execute_backend=*/nullptr),
       compiler_(std::move(compiler)) {}
 
-absl::StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>
+absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
 CompileOnlyService::CompileAheadOfTime(
-    absl::Span<const AotXlaComputationInstance> computations,
+    const AotXlaComputationInstance& computation,
     const AotCompilationOptions& options,
     std::unique_ptr<AotCompilationMetadata>* metadata) {
-  std::vector<std::unique_ptr<HloModule>> hlo_modules;
-
   const DebugOptions& debug_options = options.debug_options();
   ExecutionOptions execution_options;
   *execution_options.mutable_debug_options() = debug_options;
@@ -103,44 +102,39 @@ CompileOnlyService::CompileAheadOfTime(
     execution_options.mutable_auto_spmd_partitioning_mesh_ids()->Add(t);
   }
   execution_options.set_deduplicate_hlo(options.deduplicate_hlo());
-  for (const AotXlaComputationInstance& instance : computations) {
-    TF_RET_CHECK(instance.computation.has_host_program_shape());
-    auto update_shape_with_empty_tiles = [this](Shape* subshape,
-                                                const xla::ShapeIndex& index) {
-      if (subshape->IsArray() &&
-          (!subshape->has_layout() || subshape->layout().tiles().empty())) {
-        *subshape = compiler_->DefaultDeviceShapeRepresentation(*subshape);
-      }
-    };
-    Shape result_layout(instance.result_layout);
-    ShapeUtil::ForEachMutableSubshape(&result_layout,
-                                      update_shape_with_empty_tiles);
-    *execution_options.mutable_shape_with_output_layout() =
-        result_layout.ToProto();
-    for (auto shape : instance.argument_layouts) {
-      ShapeUtil::ForEachMutableSubshape(const_cast<Shape*>(shape),
-                                        update_shape_with_empty_tiles);
+  TF_RET_CHECK(computation.computation.has_host_program_shape());
+  auto update_shape_with_empty_tiles = [this](Shape* subshape,
+                                              const xla::ShapeIndex& index) {
+    if (subshape->IsArray() &&
+        (!subshape->has_layout() || subshape->layout().tiles().empty())) {
+      *subshape = compiler_->DefaultDeviceShapeRepresentation(*subshape);
     }
-
-    TF_ASSIGN_OR_RETURN(
-        ProgramShape program_shape,
-        ProgramShape::FromProto(instance.computation.host_program_shape()));
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<HloModuleConfig> module_config,
-        CreateModuleConfig(program_shape, instance.argument_layouts,
-                           &execution_options, &options));
-
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<HloModule> hlo_module,
-        HloModule::CreateFromProto(instance.computation, *module_config));
-    DumpHloModuleIfEnabled(*hlo_module, "before_optimizations");
-    hlo_modules.push_back(std::move(hlo_module));
+  };
+  Shape result_layout(computation.result_layout);
+  ShapeUtil::ForEachMutableSubshape(&result_layout,
+                                    update_shape_with_empty_tiles);
+  *execution_options.mutable_shape_with_output_layout() =
+      result_layout.ToProto();
+  for (auto shape : computation.argument_layouts) {
+    ShapeUtil::ForEachMutableSubshape(const_cast<Shape*>(shape),
+                                      update_shape_with_empty_tiles);
   }
 
-  return compiler_->CompileAheadOfTime(
-      std::make_unique<HloModuleGroup>(hlo_modules[0]->name(),
-                                       absl::MakeSpan(hlo_modules)),
-      options, metadata);
+  ASSIGN_OR_RETURN(
+      ProgramShape program_shape,
+      ProgramShape::FromProto(computation.computation.host_program_shape()));
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<HloModuleConfig> module_config,
+      CreateModuleConfig(program_shape, computation.argument_layouts,
+                         &execution_options, &options));
+
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<HloModule> hlo_module,
+      HloModule::CreateFromProto(computation.computation, *module_config));
+  DumpHloModuleIfEnabled(*hlo_module, "before_optimizations");
+
+  return compiler_->CompileAheadOfTime(std::move(hlo_module), options,
+                                       metadata);
 }
 
 }  // namespace xla

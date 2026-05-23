@@ -12,6 +12,13 @@ package(
     licenses = ["notice"],
 )
 
+package_group(
+    name = "friends",
+    includes = [
+        "//xla/tsl/profiler:friends",
+    ],
+)
+
 cc_library(
     name = "trace_container",
     srcs = ["trace_container.cc"],
@@ -32,6 +39,7 @@ cc_library(
     srcs = [tf_profiler_alias("//xla/tsl/profiler/convert/", "xla_op_utils.cc")],
     hdrs = ["xla_op_utils.h"],
     visibility = internal_visibility([
+        ":friends",
         "//xla/tsl/profiler:internal",
         "//xla/tsl/profiler:xla_profiler_backends",
         "//xla/python:__pkg__",
@@ -50,6 +58,7 @@ tsl_cc_test(
     deps = [
         ":xla_op_utils",
         "//xla/tsl/platform:test",
+        "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -66,7 +75,10 @@ cc_library(
         "//xla/tsl/profiler/utils:xplane_schema",
         "//xla/tsl/profiler/utils:xplane_utils",
         "//xla/tsl/profiler/utils:xplane_visitor",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
     ],
 )
@@ -78,9 +90,9 @@ tsl_cc_test(
     deps = [
         ":post_process_single_host_xplane",
         "//xla/tsl/platform:test",
-        "//xla/tsl/profiler/utils:trace_utils",
         "//xla/tsl/profiler/utils:xplane_builder",
         "//xla/tsl/profiler/utils:xplane_schema",
+        "//xla/tsl/profiler/utils:xplane_utils",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_googletest//:gtest_main",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",

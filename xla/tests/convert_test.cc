@@ -65,14 +65,8 @@ using FloatingPointTypeList =
     ::testing::Types<tsl::float8_e3m4, tsl::float8_e4m3, tsl::float8_e4m3fn,
                      tsl::float8_e4m3fnuz, tsl::float8_e4m3b11fnuz,
                      tsl::float8_e5m2, tsl::float8_e5m2fnuz, Eigen::half,
-                     bfloat16, float,
-                     double
-#ifndef XLA_TEST_BACKEND_TPU
-                     // TODO(b/385004399): Run tests on these types on TPU.
-                     ,
-                     tsl::float4_e2m1fn, tsl::float8_e8m0fnu
-#endif
-                     >;
+                     bfloat16, float, double, tsl::float4_e2m1fn,
+                     tsl::float8_e8m0fnu>;
 TYPED_TEST_SUITE(ConvertTestT, FloatingPointTypeList);
 
 template <typename T>
@@ -1940,9 +1934,6 @@ TYPED_TEST(ConvertTestF16, ConvertF8e3m4F16RoundtripExhaustive4) {
 // ----- F4E2M1FN
 
 TEST_F(ConvertTest, ConvertF16F4e2m1fnRoundtrip) {
-  if (test::DeviceTypeIs(test::kTpu)) {
-    GTEST_SKIP();
-  }
   // Convert from FP16 to FP4, then back to FP16.
   XlaBuilder builder(TestName());
   float inf = std::numeric_limits<float>::infinity();
@@ -1992,7 +1983,7 @@ TEST_F(ConvertTest, ConvertF16F4e2m1fnRoundtrip) {
 }
 
 TEST_F(ConvertTest, ConvertF32F4e2m1fnRoundtrip) {
-  if (test::DeviceIs(test::kCpu) || test::DeviceTypeIs(test::kTpu)) {
+  if (test::DeviceIs(test::kCpu)) {
     GTEST_SKIP();
   }
   // Convert from FP32 to FP4, then back to FP32.
@@ -2020,13 +2011,15 @@ TEST_F(ConvertTest, ConvertF32F4e2m1fnRoundtrip) {
       {0x1.8p-1, 0x1p0},        // Smallest number rounding up to normal
 
       // Denormal tests
-      {0x1.0p-1, 0x1.0p-1},     // Denormal without rounding
-      {0x1.8p-1, 0x1.0p0},      // Round-to-even up
-      {0x1.6p-1, 0x1.0p-1},     // Round-to-nearest down
-      {0x1.Ep-1, 0x1.0p0},      // Round-to-nearest up
-      {0x1p-2, 0},              // Largest number that underflows
-      {0x1.000002p-2, 0x1p-1},  // Smallest number that doesn't underflow
-      {0x1.7FFFFEp-1, 0x1p-1},  // Largest number that rounds to denormal
+      {0x1.0p-1, 0x1.0p-1},       // Denormal without rounding
+      {0x1.8p-1, 0x1.0p0},        // Round-to-even up
+      {0x1.6p-1, 0x1.0p-1},       // Round-to-nearest down
+      {0x1.Ep-1, 0x1.0p0},        // Round-to-nearest up
+      {0x1p-2, 0},                // Largest number that underflows
+      {0x1.000002p-2, 0x1p-1},    // Smallest number that doesn't underflow
+      {0x1.7FFFFEp-1, 0x1p-1},    // Largest number that rounds to denormal
+      {3.40282347e+38f, 6.0f},    // F32 MaxValue (saturate to max)
+      {-3.40282347e+38f, -6.0f},  // F32 -MaxValue (saturate to -max)
   };
 
   std::vector<float> inputs;
@@ -2036,9 +2029,12 @@ TEST_F(ConvertTest, ConvertF32F4e2m1fnRoundtrip) {
     expected_roundtrip.push_back(test_case.expected_roundtrip);
   }
 
-  auto f4 = ConvertElementType(ConstantR1<float>(&builder, inputs), F4E2M1FN);
+  auto param0 = LiteralUtil::CreateR1<float>(inputs);
+  XlaOp x = Parameter(&builder, 0, param0.shape(), "input");
+  auto f4 = ConvertElementType(x, F4E2M1FN);
   ConvertElementType(f4, F32);
-  ComputeAndCompareR1<float>(&builder, expected_roundtrip, {}, ErrorSpec(0.));
+  ComputeAndCompareR1<float>(&builder, expected_roundtrip, {&param0},
+                             ErrorSpec(0.));
 }
 
 TYPED_TEST(ConvertTestT, ConvertF4e2m1fnRoundtripExhaustive) {
@@ -2116,9 +2112,6 @@ TYPED_TEST(ConvertTestF16, ConvertF4e2m1fnF16RoundtripExhaustive4) {
 // ----- F8E8M0FNU
 
 TEST_F(ConvertTest, ConvertF32F8e8m0fnuRoundtrip) {
-  if (test::DeviceTypeIs(test::kTpu)) {
-    GTEST_SKIP();
-  }
   // Convert from FP32 to FP8, then back to FP32.
   XlaBuilder builder(TestName());
   float nan = std::numeric_limits<float>::quiet_NaN();

@@ -23,6 +23,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -57,7 +58,7 @@ void GatherFusionInstructions(
 LogicalBufferAnalysis::Run(const HloModule* module) {
   std::unique_ptr<LogicalBufferAnalysis> analysis(
       new LogicalBufferAnalysis(module));
-  TF_RETURN_IF_ERROR(analysis->Analyze());
+  RETURN_IF_ERROR(analysis->Analyze());
   return analysis;
 }
 
@@ -73,7 +74,7 @@ absl::Status LogicalBufferAnalysis::Analyze() {
   // fusion computations, and we don't want to try to assign buffers to those.
   std::vector<HloInstruction*> fusion_instructions;
   for (auto* computation : module_->MakeNonfusionComputations()) {
-    TF_RETURN_IF_ERROR(computation->Accept(this));
+    RETURN_IF_ERROR(computation->Accept(this));
     for (auto* instruction : computation->instructions()) {
       if (instruction->opcode() != HloOpcode::kFusion) {
         continue;
@@ -82,7 +83,7 @@ absl::Status LogicalBufferAnalysis::Analyze() {
     }
   }
   for (auto* instruction : fusion_instructions) {
-    TF_RETURN_IF_ERROR(
+    RETURN_IF_ERROR(
         instruction->fused_instructions_computation()->Accept(this));
   }
   return absl::OkStatus();
@@ -226,6 +227,25 @@ absl::Status LogicalBufferAnalysis::HandleFusion(HloInstruction* fusion) {
                                  NewLogicalBuffer(fusion, index);
                                }
                              });
+  return absl::OkStatus();
+}
+
+absl::Status LogicalBufferAnalysis::HandleAsyncStart(
+    HloInstruction* async_start) {
+  absl::flat_hash_set<ShapeIndex> aliased_outputs;
+  for (const auto& pair : Cast<HloAsyncStartInstruction>(async_start)
+                              ->output_to_operand_aliasing()) {
+    aliased_outputs.insert(pair.first);
+  }
+
+  ShapeUtil::ForEachSubshape(
+      async_start->shape(), [&](const Shape& shape, const ShapeIndex& index) {
+        bool has_implicit_alias = (index.size() >= 2 && index.front() == 0);
+        bool has_explicit_alias = aliased_outputs.contains(index);
+        if (!has_implicit_alias && !has_explicit_alias) {
+          NewLogicalBuffer(async_start, index);
+        }
+      });
   return absl::OkStatus();
 }
 

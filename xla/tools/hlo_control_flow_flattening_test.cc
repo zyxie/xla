@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/transforms/despecializer.h"
@@ -33,7 +34,9 @@ limitations under the License.
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/hlo_verifier.h"
 #include "xla/service/spmd/spmd_partitioner.h"
+#include "xla/shape.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -47,7 +50,6 @@ class HloControlFlowFlatteningTest : public HloHardwareIndependentTestBase {
     spmd::SpmdPartitionerOptions options;
     auto collective_ops_creator =
         spmd::GetDefaultCollectiveOpsCreator(num_devices, /*num_replicas=*/1);
-    collective_ops_creator.create_cross_partition_all_gather = nullptr;
 
     HloModuleConfig config = GetModuleConfigForTest();
     config.set_use_spmd_partitioning(true);
@@ -59,7 +61,7 @@ class HloControlFlowFlatteningTest : public HloHardwareIndependentTestBase {
                                         options, collective_ops_creator);
     pass.AddPass<HloVerifier>(/*layout_sensitive=*/false,
                               /*allow_mixed_precision=*/false);
-    TF_RETURN_IF_ERROR(pass.Run(hlo_module.get()).status());
+    RETURN_IF_ERROR(pass.Run(hlo_module.get()).status());
     return absl::StatusOr<std::unique_ptr<HloModule>>(std::move(hlo_module));
   }
 };
@@ -1143,6 +1145,43 @@ TEST_F(HloControlFlowFlatteningTest, NotMatchEqUseDefaultLoopCount) {
   EXPECT_EQ(GetLoopBound(*module->entry_computation()->root_instruction(), 123,
                          kDefaultMaxLoopCount),
             123);
+}
+
+TEST_F(HloControlFlowFlatteningTest, RemoveDynamicShapes) {
+  constexpr absl::string_view kHlo = R"(
+HloModule main, entry_computation_layout={(s32[<=1024]{0})->(s32[<=1024]{0})}
+
+ENTRY main {
+  arg.0 = s32[<=1024] parameter(0)
+  ROOT tuple.0 = tuple(arg.0)
+}
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+
+  HloControlFlowFlattening::Options options;
+  options.remove_dynamic_shapes = true;
+  HloControlFlowFlattening flattening(options);
+  EXPECT_TRUE(flattening.Run(module.get()).value());
+
+  // There should not be any instructions with dynamic shapes.
+  for (HloInstruction* instruction :
+       module->entry_computation()->instructions()) {
+    EXPECT_FALSE(instruction->shape().is_dynamic());
+  }
+
+  // There should not be any shapes in entry computation layout with dynamic
+  // shapes.
+  ASSERT_TRUE(module->config().has_entry_computation_layout());
+  for (int32_t idx = 0; idx < module->entry_computation()->num_parameters();
+       ++idx) {
+    Shape parameter_shape =
+        module->config().entry_computation_layout().parameter_shape(idx);
+    EXPECT_FALSE(parameter_shape.is_dynamic());
+  }
+  Shape result_shape =
+      module->config().entry_computation_layout().result_shape();
+  EXPECT_FALSE(result_shape.is_dynamic());
 }
 
 }  // namespace

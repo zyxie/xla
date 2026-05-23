@@ -15,10 +15,11 @@ limitations under the License.
 
 #include "xla/tsl/platform/env_time.h"
 
-#include <time.h>
 #include <windows.h>
 
 #include <chrono>
+#include <cstdint>
+#include <ctime>
 
 using std::chrono::duration_cast;
 using std::chrono::nanoseconds;
@@ -30,7 +31,7 @@ namespace {
 typedef VOID(WINAPI* FnGetSystemTimePreciseAsFileTime)(LPFILETIME);
 }
 
-uint64 EnvTime::NowNanos() {
+uint64_t EnvTime::NowNanos() {
   static FnGetSystemTimePreciseAsFileTime precise_time_function =
       []() -> FnGetSystemTimePreciseAsFileTime {
     HMODULE module = GetModuleHandleW(L"kernel32.dll");
@@ -47,7 +48,7 @@ uint64 EnvTime::NowNanos() {
     // versions of Windows, so we need to check for its existence here.
     // All std::chrono clocks on Windows proved to return values that may
     // repeat, which is not good enough for some uses.
-    constexpr int64_t kUnixEpochStartTicks = 116444736000000000i64;
+    constexpr int64_t kUnixEpochStartTicks = 116444736000000000LL;
 
     // This interface needs to return system time and not just any time
     // because it is often used as an argument to TimedWait() on condition

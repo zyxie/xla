@@ -24,9 +24,12 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_clone_context.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/service/while_util.h"
@@ -56,7 +59,7 @@ absl::Status ReplaceUsesWhileKeepingLoopInvariance(
     for (int64_t i = 0, e = user->operand_count(); i < e; i++) {
       if (user->operand(i) == old_instr &&
           !(user == while_body_root && i == tuple_index)) {
-        TF_RETURN_IF_ERROR(user->ReplaceOperandWith(i, new_instr));
+        RETURN_IF_ERROR(user->ReplaceOperandWith(i, new_instr));
       }
     }
   }
@@ -127,7 +130,7 @@ absl::StatusOr<bool> WhileLoopConstantSinking::TrySinkingConstantsIntoWhileLoop(
       }
       HloInstruction* constant_instr =
           CloneHelper(&invariant_value, body_clone);
-      TF_RETURN_IF_ERROR(ReplaceUsesWhileKeepingLoopInvariance(
+      RETURN_IF_ERROR(ReplaceUsesWhileKeepingLoopInvariance(
           body_clone_context.FindInstruction(invariant_body_gte),
           constant_instr,
           body_clone_context.FindInstruction(while_body->root_instruction()),
@@ -152,8 +155,8 @@ absl::StatusOr<bool> WhileLoopConstantSinking::TrySinkingConstantsIntoWhileLoop(
             CloneHelper(&invariant_value, cond_clone);
         HloInstruction* cond_gte =
             cond_clone_context.FindInstruction(invariant_cond_gte);
-        TF_RETURN_IF_ERROR(cond_gte->ReplaceAllUsesWith(constant_instr));
-        TF_RETURN_IF_ERROR(cond_clone->RemoveInstruction(cond_gte));
+        RETURN_IF_ERROR(cond_gte->ReplaceAllUsesWith(constant_instr));
+        RETURN_IF_ERROR(cond_clone->RemoveInstruction(cond_gte));
       }
     }
   }
@@ -161,7 +164,7 @@ absl::StatusOr<bool> WhileLoopConstantSinking::TrySinkingConstantsIntoWhileLoop(
   return body_clone || cond_clone;
 }
 
-absl::StatusOr<bool> WhileLoopConstantSinking::Run(
+absl::StatusOr<bool> WhileLoopConstantSinking::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   VLOG(2) << "HLO module before WhileLoopConstantSinking:";
@@ -204,8 +207,8 @@ absl::StatusOr<bool> WhileLoopConstantSinking::Run(
       // Sinking constants may change the called computations, so do that first
       // if this is a while instruction.
       if (instr->opcode() == HloOpcode::kWhile) {
-        TF_ASSIGN_OR_RETURN(bool result,
-                            TrySinkingConstantsIntoWhileLoop(module, instr));
+        ASSIGN_OR_RETURN(bool result,
+                         TrySinkingConstantsIntoWhileLoop(module, instr));
         changed |= result;
       }
       for (HloComputation* child : instr->called_computations()) {
@@ -213,9 +216,9 @@ absl::StatusOr<bool> WhileLoopConstantSinking::Run(
       }
     }
   }
-  TF_RETURN_IF_ERROR(module->RemoveUnusedComputations());
 
   if (changed) {
+    RETURN_IF_ERROR(module->RemoveUnusedComputations());
     VLOG(2) << "HLO module after WhileLoopConstantSinking:";
     XLA_VLOG_LINES(2, module->ToString());
   } else {

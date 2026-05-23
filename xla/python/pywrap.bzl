@@ -17,8 +17,9 @@
 # NO_VISIBILITY_DECLARATION=.bzl file is intentionally exported to, e.g., JAX.
 
 load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load(
-    "//third_party/py/rules_pywrap:pywrap.impl.bzl",
+    "@rules_ml_toolchain//py/rules_pywrap:pywrap.impl.bzl",
     "pybind_extension",
     _pywrap_binaries = "pywrap_binaries",
     _pywrap_library = "pywrap_library",
@@ -35,7 +36,11 @@ def nanobind_pywrap_extension(
         pytype_deps = [],  # @unused
         copts = [],
         linkopts = [],
-        visibility = None):
+        visibility = None,
+        enable_stub_generation = True,  # @unused
+        stub_replacement_patterns = {},  # @unused
+        additional_stubgen_deps = [],  # @unused
+        postprocess_stubgen = None):  # @unused
     # buildifier: disable=function-docstring-args
     "Python extension rule using nanobind and the pywrap rules."
     module_name = name
@@ -45,7 +50,7 @@ def nanobind_pywrap_extension(
     # We put the entire contents of the extension in a single cc_library, which will become part of
     # the common pywrap library. All the contents of all extensions will end up in the common
     # library.
-    native.cc_library(
+    cc_library(
         name = lib_name,
         srcs = srcs,
         copts = copts,

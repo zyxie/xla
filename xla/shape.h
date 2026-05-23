@@ -30,6 +30,7 @@ limitations under the License.
 
 #include "absl/base/attributes.h"
 #include "absl/base/macros.h"
+#include "absl/base/optimization.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/types/span.h"
@@ -76,12 +77,6 @@ class Shape {
   Shape& operator=(const Shape&);
   Shape& operator=(Shape&&) noexcept;
 
-  // Constructs a shape from a ShapeProto. Results in an invalid shape (as
-  // opposed to crashing) if the proto has logically invalid fields.
-  ABSL_DEPRECATE_AND_INLINE()
-  explicit Shape(const ShapeProto& shape_proto)
-      : Shape(FromProto(shape_proto).value_or(Shape())) {}
-
   // Creates a token, opaque or buffer shape.
   // Precondition:
   //  - `element_type` must be TOKEN, OPAQUE_TYPE or BUFFER.
@@ -106,6 +101,9 @@ class Shape {
   // opposed to crashing) if the proto has logically invalid fields.
   static absl::StatusOr<Shape> FromProto(const ShapeProto& shape_proto);
 
+  // Converts the Shape to a ShapeProto. Clears `proto` first.
+  void ToProto(ShapeProto& proto) const;
+
   // Returns a ShapeProto representation of the Shape.
   ShapeProto ToProto() const;
 
@@ -117,48 +115,59 @@ class Shape {
   // without layout. e.g. "F32[42,12] {0, 1}" or "F32[64]".
   std::string ToString(bool print_layout = false) const;
 
-  // Returns whether the shape is of the specified category (array, tuple, etc).
-  bool IsArray() const {
-    const bool result = primitive_util::IsArrayType(element_type());
+  // Returns whether the shape is an array primitive type, that is, whether the
+  // state of the shape is an ArrayState.
+  bool IsArrayExcludingBuffer() const {
+    const bool result =
+        primitive_util::IsArrayType(element_type_including_buffer());
     // We do this check in debug mode only to avoid performance regressions.
     DCHECK_EQ(result, if_array_state() != nullptr)
         << "Shape " << ToString()
         << " has inconsistent element_type and state.";
     return result;
   }
+  // Returns whether the shape is a tuple primitive type, that is, whether the
+  // state of the shape is a TupleState.
   bool IsTuple() const {
-    const bool result = element_type() == TUPLE;
+    const bool result = element_type_including_buffer() == TUPLE;
     // We do this check in debug mode only to avoid performance regressions.
     DCHECK_EQ(result, if_tuple_state() != nullptr)
         << "Shape " << ToString()
         << " has inconsistent element_type and state.";
     return result;
   }
+  // Returns whether the shape is a buffer primitive type, that is, whether the
+  // state of the shape is a BufferState.
   bool IsBuffer() const {
-    const bool result = element_type() == BUFFER;
+    const bool result = element_type_including_buffer() == BUFFER;
     // We do this check in debug mode only to avoid performance regressions.
     DCHECK_EQ(result, if_buffer_state() != nullptr)
         << "Shape " << ToString()
         << " has inconsistent element_type and state.";
     return result;
   }
+  // Returns whether the shape is a token primitive type, that is, whether the
+  // state of the shape is a TokenState.
   bool IsToken() const {
-    const bool result = element_type() == TOKEN;
+    const bool result = element_type_including_buffer() == TOKEN;
     // We do this check in debug mode only to avoid performance regressions.
     DCHECK_EQ(result, if_token_state() != nullptr)
         << "Shape " << ToString()
         << " has inconsistent element_type and state.";
     return result;
   }
+  // Returns whether the shape is an opaque primitive type, that is, whether the
+  // state of the shape is an OpaqueState.
   bool IsOpaque() const {
-    const bool result = element_type() == OPAQUE_TYPE;
+    const bool result = element_type_including_buffer() == OPAQUE_TYPE;
     // We do this check in debug mode only to avoid performance regressions.
     DCHECK_EQ(result, if_opaque_state() != nullptr)
         << "Shape " << ToString()
         << " has inconsistent element_type and state.";
     return result;
   }
-  bool IsArrayOrBuffer() const { return IsArray() || IsBuffer(); }
+  // Returns true if the shape is an array or a buffer.
+  bool IsArray() const { return IsArrayExcludingBuffer() || IsBuffer(); }
 
   // Returns whether all elements in the shape are integers.
   // Tuple shapes are traversed recursively.
@@ -251,12 +260,11 @@ class Shape {
   void DeleteDimensions(absl::Span<const int64_t> dims_to_delete);
 
   // Returns the primitive type of the shape.
-  PrimitiveType element_type() const { return element_type_; }
+  PrimitiveType element_type_including_buffer() const { return element_type_; }
 
   // Returns the primitive type of the array or buffer shape.
   // Precondition: this is an array shape or a buffer shape.
-  PrimitiveType array_or_buffer_element_type() const {
-    CHECK(IsArrayOrBuffer());
+  PrimitiveType element_type() const {
     if (const auto* const state = if_buffer_state()) {
       return state->buffer_shape->element_type();
     }
@@ -380,7 +388,7 @@ class Shape {
       return false;
     }
     const ArrayState& state = array_state_maybe_underneath_buffer();
-    return state.layout != std::nullopt;
+    return state.layout.has_value();
   }
 
   // Returns the layout of the shape.
@@ -397,7 +405,7 @@ class Shape {
   // by this shape.
   Layout* mutable_layout() {
     ArrayState& state = array_state_maybe_underneath_buffer();
-    if (state.layout == std::nullopt) {
+    if (!state.layout.has_value()) {
       state.layout.emplace();
     }
     return &(*state.layout);
@@ -662,6 +670,9 @@ class Shape {
   // CHECK-fails if this shape's state is not empty.
   void CheckStateIsEmpty() const;
 
+  // Converts this shape to a proto. `proto` must be an empty message.
+  void SaveToEmptyProto(ShapeProto& proto) const;
+
   // The element type of this shape (tuple, array, etc).
   PrimitiveType element_type_ = PRIMITIVE_TYPE_INVALID;
 
@@ -684,17 +695,12 @@ class ProgramShape {
   ProgramShape& operator=(const ProgramShape&);
   ProgramShape& operator=(ProgramShape&&);
 
-  // Constructs a ProgramShape from a ProgramShapeProto protobuf. If the
-  // ProgramShapeProto is invalid, an empty ProgramShape is constructed.
-  ABSL_DEPRECATE_AND_INLINE()
-  explicit ProgramShape(const ProgramShapeProto& program_shape_proto)
-      : ProgramShape(FromProto(program_shape_proto).value_or(ProgramShape())) {}
-
   // Creates a ProgramShape from a ProgramShapeProto protobuf.
   static absl::StatusOr<ProgramShape> FromProto(
       const ProgramShapeProto& program_shape_proto);
 
   // Returns a proto representation of the object.
+  void ToProto(ProgramShapeProto& proto) const;
   ProgramShapeProto ToProto() const;
 
   void Print(Printer* printer) const;
@@ -830,21 +836,21 @@ inline Shape::BufferState& Shape::buffer_state() {
 
 inline const Shape::ArrayState& Shape::array_state_maybe_underneath_buffer()
     const {
-  if (auto* const state = if_array_state()) {
-    return *state;
+  if (const ArrayState* array = if_array_state(); ABSL_PREDICT_TRUE(array)) {
+    return *array;
   }
-  auto* const state = if_buffer_state();
-  CHECK_NE(state, nullptr);
-  return *state->buffer_shape->if_array_state();
+  const BufferState* buffer = if_buffer_state();
+  CHECK_NE(buffer, nullptr);
+  return *buffer->buffer_shape->if_array_state();
 }
 
 inline Shape::ArrayState& Shape::array_state_maybe_underneath_buffer() {
-  if (auto* state = if_array_state()) {
-    return *state;
+  if (ArrayState* array = if_array_state(); ABSL_PREDICT_TRUE(array)) {
+    return *array;
   }
-  BufferState* state = if_buffer_state();
-  CHECK_NE(state, nullptr);
-  return *state->buffer_shape->if_array_state();
+  BufferState* buffer = if_buffer_state();
+  CHECK_NE(buffer, nullptr);
+  return *buffer->buffer_shape->if_array_state();
 }
 
 inline ABSL_ATTRIBUTE_ALWAYS_INLINE const Shape& Shape::tuple_shapes(

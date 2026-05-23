@@ -16,13 +16,15 @@ limitations under the License.
 #include "xla/service/compiler.h"
 
 #include "xla/tests/xla_test_backend_predicates.h"
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "google/protobuf/text_format.h"
 #include "xla/autotune_results.pb.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/gpu/gpu_init.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/tsl/lib/core/status_test_util.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -35,7 +37,7 @@ TEST(TargetConfigTest, ExecutorConstructorFillsAllFields) {
   TF_ASSERT_OK_AND_ASSIGN(
       stream_executor::StreamExecutor * executor,
       stream_executor::GPUMachineManager()->ExecutorForDevice(0));
-  Compiler::TargetConfig config(executor);
+  Compiler::GpuTargetConfig config(executor);
   stream_executor::GpuTargetConfigProto target = config.ToProto();
 
   // We don't attempt to validate values because doing so would require talking
@@ -62,7 +64,8 @@ TEST(TargetConfigTest, ProtoConstructorFillsAllFields) {
   config_proto.mutable_gpu_device_info()->set_threads_per_block_limit(5);
   config_proto.set_device_description_str("foo");
 
-  Compiler::TargetConfig config(config_proto);
+  TF_ASSERT_OK_AND_ASSIGN(auto config,
+                          Compiler::GpuTargetConfig::FromProto(config_proto));
   stream_executor::GpuTargetConfigProto target = config.ToProto();
 
   EXPECT_EQ(target.dnn_version_info().major(),

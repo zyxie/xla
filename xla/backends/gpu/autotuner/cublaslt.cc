@@ -15,31 +15,32 @@ limitations under the License.
 
 #include "xla/backends/gpu/autotuner/cublaslt.h"
 
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
 
-#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/compiler.h"
-#include "xla/service/gpu/autotuning/redzone_buffers.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/shape.h"
+#include "xla/shape_layout.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/device_description.h"
-#include "xla/stream_executor/device_memory.h"
-#include "xla/stream_executor/device_memory_allocator.h"
 #include "xla/stream_executor/gpu/gpu_blas_lt.h"
-#include "xla/stream_executor/stream_executor.h"
-#include "xla/stream_executor/stream_executor_memory_allocator.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
@@ -75,11 +76,11 @@ absl::StatusOr<BlasLt::Epilogue> AsBlasLtEpilogue(
   }
 }
 
-bool IsSupported(const HloInstruction& instr) {
+}  // namespace
+
+bool CublasLtBackend::IsSupported(const HloInstruction& instr) {
   return IsCublasLtMatmul(instr) || IsCublasLtMatmulF8(instr);
 }
-
-}  // namespace
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
 CublasLtBackend::GetSupportedConfigs(const HloInstruction& instr) {
@@ -91,45 +92,41 @@ CublasLtBackend::GetSupportedConfigs(const HloInstruction& instr) {
       instr.backend_config<GpuBackendConfig>().value();
   const GemmBackendConfig& backend_config = gpu_config.gemm_backend_config();
 
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       GemmConfig gemm_config,
       GemmConfig::For(
           &instr, target_config().device_description.gpu_compute_capability()));
 
-  TF_ASSIGN_OR_RETURN(BlasLt::Epilogue epilogue,
-                      AsBlasLtEpilogue(backend_config.epilogue()));
+  ASSIGN_OR_RETURN(BlasLt::Epilogue epilogue,
+                   AsBlasLtEpilogue(backend_config.epilogue()));
 
-  auto allocator =
-      std::make_unique<se::StreamExecutorMemoryAllocator>(stream_executor());
-  TF_ASSIGN_OR_RETURN(
-      se::Stream * stream,
-      allocator->GetStream(stream_executor()->device_ordinal()));
+  ASSIGN_OR_RETURN(BlasLt * blas_lt, se::gpu::BlasLt::Get(stream_executor()));
 
-  TF_ASSIGN_OR_RETURN(
-      std::unique_ptr<BlasLt::MatmulPlan> plan,
-      se::gpu::BlasLt::GetMatmulPlan(stream, gemm_config, epilogue));
+  ASSIGN_OR_RETURN(std::unique_ptr<BlasLt::MatmulPlan> plan,
+                   blas_lt->GetMatmulPlan(gemm_config, epilogue));
 
-  TF_ASSIGN_OR_RETURN(RedzoneBuffers rz_buffers,
-                      RedzoneBuffers::FromInstruction(
-                          instr, allocator.get(), stream,
-                          RedzoneBuffers::kAllInputsAllOutputs, true, true,
-                          instr.GetModule()
-                              ->config()
-                              .debug_options()
-                              .xla_gpu_redzone_padding_bytes()));
-  se::DeviceMemoryBase workspace_buffer =
-      rz_buffers.output_buffers().at(instr.shape().tuple_shapes().size() - 1);
+  const Shape& output_shape = instr.shape();
+  if (!output_shape.IsTuple() || output_shape.tuple_shapes().empty()) {
+    return Internal(
+        "Invalid shape for CublasLt matmul: output is not a non-empty tuple.");
+  }
+  // The last element of the output tuple is the workspace.
+  const int64_t workspace_size =
+      ShapeUtil::ByteSizeOf(output_shape.tuple_shapes().back());
 
-  TF_ASSIGN_OR_RETURN(std::vector<BlasLt::MatmulAlgorithm> algorithms,
-                      plan->GetAlgorithms(stream, GemmConfig::kNumAlgorithms,
-                                          workspace_buffer.size()));
+  ASSIGN_OR_RETURN(
+      std::vector<BlasLt::MatmulAlgorithm> algorithms,
+      plan->GetAlgorithms(GemmConfig::kNumAlgorithms, workspace_size));
   int num_algorithms = algorithms.size();
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.reserve(num_algorithms);
   for (int i = 0; i < num_algorithms; ++i) {
-    auto gemm_key = std::make_unique<CublasLtBackendConfig>();
-    gemm_key->set_algorithm(i);
-    configs.push_back(std::move(gemm_key));
+    CublasLtBackendConfig gemm_key;
+    gemm_key.set_algorithm(i);
+    gemm_key.set_autotune_workspace_size(workspace_size);
+    auto any = std::make_unique<google::protobuf::Any>();
+    any->PackFrom(gemm_key);
+    configs.push_back(std::move(any));
   }
 
   return configs;
@@ -143,19 +140,45 @@ CublasLtBackend::GetDefaultConfig(const HloInstruction& instr) {
   }
 
   AutotuneResult::GemmKey gemm_key;
-  gemm_key.set_algorithm(se::blas::kDefaultAlgorithm);
-  return std::make_unique<CublasLtBackendConfig>(gemm_key);
+  gemm_key.set_algorithm(0);
+  // We don't know the workspace size in advance, so we pick a reasonably large
+  // value that is likely to be sufficient.
+  gemm_key.set_autotune_workspace_size(4194304);  // 4MiB
+  auto any = std::make_unique<google::protobuf::Any>();
+  any->PackFrom(gemm_key);
+  return any;
 }
 
 absl::Status CublasLtBackend::ApplyConfig(HloInstruction& instr,
                                           const BackendConfig& config) {
-  const CublasLtBackendConfig& gemm_key =
-      static_cast<const CublasLtBackendConfig&>(config);
-  TF_ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
-                      instr.backend_config<GpuBackendConfig>());
+  CublasLtBackendConfig gemm_key;
+  if (!config.UnpackTo(&gemm_key)) {
+    return absl::InvalidArgumentError(
+        "Failed to unpack CublasLtBackendConfig from Any.");
+  }
+  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
+                   instr.backend_config<GpuBackendConfig>());
   GemmBackendConfig& backend_config = *gpu_config.mutable_gemm_backend_config();
   backend_config.set_selected_algorithm(gemm_key.algorithm());
-  TF_RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+  backend_config.set_autotune_workspace_size(
+      gemm_key.autotune_workspace_size());
+  RETURN_IF_ERROR(instr.set_backend_config(std::move(gpu_config)));
+
+  if (instr.shape().IsTuple() && !instr.shape().tuple_shapes().empty()) {
+    Shape* workspace_shape = instr.mutable_shape()->mutable_tuple_shapes(
+        instr.shape().tuple_shapes().size() - 1);
+    if (workspace_shape->element_type() == S8 &&
+        workspace_shape->dimensions().size() == 1) {
+      workspace_shape->set_dimensions(0, gemm_key.autotune_workspace_size());
+      if (HloModule* module = instr.GetModule()) {
+        if (module->entry_computation() &&
+            module->entry_computation()->root_instruction() == &instr) {
+          *module->mutable_entry_computation_layout()->mutable_result_layout() =
+              ShapeLayout(instr.shape());
+        }
+      }
+    }
+  }
   return absl::OkStatus();
 }
 

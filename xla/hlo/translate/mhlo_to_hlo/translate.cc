@@ -15,6 +15,7 @@ limitations under the License.
 #include "xla/hlo/translate/mhlo_to_hlo/translate.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SMLoc.h"
 #include "llvm/Support/SourceMgr.h"
@@ -42,9 +44,12 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/translate/mhlo_to_hlo/attribute_exporter.h"
 #include "xla/hlo/translate/mhlo_to_hlo/mlir_hlo_to_hlo.h"
 #include "xla/hlo/translate/mhlo_to_hlo/type_to_shape.h"
-#include "xla/mlir_hlo/mhlo/IR/register.h"
+#include "xla/hlo/translate/register.h"
+#include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
+#include "xla/mlir_hlo/utils/unregistered_attributes.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/service/hlo_proto_util.h"
@@ -52,8 +57,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
-
-constexpr char kParameterReplicationAttr[] = "mhlo.parameter_replication";
+#include "tsl/platform/protobuf.h"
 
 namespace xla {
 
@@ -76,16 +80,17 @@ mlir::LogicalResult MlirHloToHloTranslateFunction(mlir::ModuleOp module,
   }
 
   // Print as HloProto with empty BufferAssignment for legacy compatibility.
-  output << MakeHloProto(*statusOrModule.value()).DebugString();
+  output << tsl::LegacyUnredactedDebugString(
+      MakeHloProto(*statusOrModule.value()));
   return mlir::success();
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> HloModuleFromProto(
     const HloProto& hlo_proto) {
   const HloModuleProto& module_proto = hlo_proto.hlo_module();
-  TF_ASSIGN_OR_RETURN(const HloModuleConfig module_config,
-                      HloModule::CreateModuleConfigFromProto(
-                          module_proto, GetDebugOptionsFromFlags()));
+  ASSIGN_OR_RETURN(const HloModuleConfig module_config,
+                   HloModule::CreateModuleConfigFromProto(
+                       module_proto, GetDebugOptionsFromFlags()));
   return HloModule::CreateFromProto(module_proto, module_config);
 }
 
@@ -103,14 +108,23 @@ absl::Status ConvertMlirHloToHloViaBuilder(
   for (mlir::BlockArgument& arg : block.getArguments()) {
     auto num = arg.getArgNumber();
     xla::Shape shape = xla::TypeToShape(arg.getType());
+
+    std::optional<OriginalValueProto> original_value_proto;
+    if (auto original_value_attr =
+            main.getArgAttrOfType<mlir::mhlo::OriginalValueAttr>(
+                num, xla::kMhloOriginalValueAttr)) {
+      original_value_proto = xla::ConvertOriginalValue(original_value_attr);
+    }
+    xla::XlaScopedOriginalValueAssignment original_value_assignment(
+        &builder, original_value_proto);
     XlaOp argop =
         xla::Parameter(&builder, num, shape, absl::StrCat("Arg_", num));
     xla_params.push_back(argop);
   }
 
   std::vector<xla::XlaOp> returns(1);
-  TF_RETURN_IF_ERROR(
-      mlir::BuildHloFromMlirHlo(block, builder, xla_params, returns, options));
+  RETURN_IF_ERROR(
+      mlir::BuildHloFromMlirHlo(module, builder, xla_params, returns, options));
 
   xla::XlaOp return_value;
   if (returns.size() == 1)
@@ -118,7 +132,7 @@ absl::Status ConvertMlirHloToHloViaBuilder(
   else if (returns.size() > 1)
     return_value = xla::Tuple(&builder, returns);
 
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       xla::XlaComputation computation,
       return_value.valid() ? builder.Build(return_value) : builder.Build());
 
@@ -127,16 +141,19 @@ absl::Status ConvertMlirHloToHloViaBuilder(
     computation.mutable_proto()->mutable_computations(0)->set_execution_thread(
         execution_thread.str());
   }
-  for (int i = 0; i < main.getNumArguments(); ++i)
+  for (int i = 0; i < main.getNumArguments(); ++i) {
     if (auto pr = main.getArgAttrOfType<mlir::ArrayAttr>(
-            i, kParameterReplicationAttr))
-      for (auto b : pr.getValue())
+            i, xla::kMhloParameterReplication)) {
+      for (auto b : pr.getValue()) {
         computation.mutable_proto()
             ->mutable_computations(0)
             ->mutable_instructions(i)
             ->mutable_parameter_replication()
             ->add_replicated_at_leaf_buffers(
                 mlir::cast<mlir::BoolAttr>(b).getValue());
+      }
+    }
+  }
 
   auto hlo_module = computation.proto();
   mlir::StringRef module_name = module.getName() ? *module.getName() : "main";
@@ -208,8 +225,7 @@ mlir::LogicalResult MlirHloToHloTextMain(
   source_mgr->AddNewSourceBuffer(std::move(buffer), llvm::SMLoc());
 
   mlir::DialectRegistry registry;
-  mlir::mhlo::registerAllMhloDialects(registry);
-  registry.insert<mlir::func::FuncDialect>();
+  xla::RegisterMlirToHloDependentDialects(registry);
 
   mlir::MLIRContext context(registry);
   mlir::OwningOpRef<mlir::ModuleOp> module =

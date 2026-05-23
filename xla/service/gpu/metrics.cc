@@ -114,7 +114,7 @@ void RecordGpuCompilerStacktrace() {
   stack.pop_front();
   stack.pop_back();
 
-  const int kMaxStackDepth = 10;
+  const int kMaxStackDepth = 15;
   if (stack.size() > kMaxStackDepth) {
     stack.resize(kMaxStackDepth);
   }
@@ -134,8 +134,7 @@ void RecordGpuCompilerStacktrace() {
 }
 
 int GetGpuCompilerStacktraceCount(absl::string_view stacktrace) {
-  return gpu_compiler_stacktrace_count->GetCell(std::string(stacktrace))
-      ->value();
+  return gpu_compiler_stacktrace_count->GetCell(stacktrace)->value();
 }
 
 }  // namespace xla

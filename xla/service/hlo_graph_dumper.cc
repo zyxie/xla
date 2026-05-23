@@ -29,25 +29,23 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "xla/comparison_util.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_module_metadata.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/shape.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/file_system.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/file_system.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tsl/platform/thread_annotations.h"
 
 #ifndef _WIN32
 #include <unistd.h>
 #endif
 
-#include <algorithm>
-#include <atomic>
 #include <deque>
 #include <functional>
-#include <map>
-#include <memory>
 #include <optional>
-#include <queue>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -61,30 +59,22 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
-#include "xla/layout_util.h"
 #include "xla/literal.h"
 #include "xla/primitive_util.h"
 #include "xla/service/gpu/backend_configs.pb.h"
-#include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/tsl/lib/gtl/map_util.h"
 #include "xla/tsl/lib/io/zlib_compression_options.h"
 #include "xla/tsl/lib/io/zlib_outputbuffer.h"
-#include "xla/types.h"
 #include "xla/util.h"
-#include "xla/window_util.h"
 #include "tsl/platform/base64.h"
-#include "tsl/platform/env.h"
-#include "tsl/platform/numbers.h"
-#include "tsl/platform/protobuf.h"
-#include "tsl/platform/regexp.h"
-#include "tsl/platform/status.h"
 
 namespace xla {
 namespace {
@@ -95,6 +85,16 @@ using absl::StrFormat;
 using absl::StrJoin;
 using std::nullopt;
 using std::optional;
+
+// Some fused instructions are not in a fusion computation; require the parent
+// computation's FusionInstruction to be present before treating them as fused.
+bool IsFusedWithParentFusionInstNotNull(const HloInstruction* instr) {
+  if (!instr->IsFused()) {
+    return false;
+  }
+  const HloComputation* parent = instr->parent();
+  return parent != nullptr && parent->FusionInstruction() != nullptr;
+}
 
 // Used to indicate how we should treat a given HLOInstruction in the graph.
 // should we treat it like normal, hide it, and so on?
@@ -644,12 +644,17 @@ stylesheet=<
     // If this edge crosses a fusion cluster boundary, highlight it when the
     // cluster is hovered over.
     if (to_node) {
-      if (from_node->IsFused() &&
+      // Only treat as fused if the parent fusion instruction exists; needed
+      // for reliable cluster membership.
+      if (IsFusedWithParentFusionInstNotNull(from_node) &&
           from_node->parent()->root_instruction() == from_node) {
         int64_t cluster_id = cluster_ids_.at(from_node->parent());
         add_hover_css_rule("clust", cluster_id, kBlue);
       }
-      if (to_node->IsFused() && to_node->opcode() == HloOpcode::kParameter) {
+      // Fusion parameters should only map to a cluster when the fusion
+      // instruction is present.
+      if (IsFusedWithParentFusionInstNotNull(to_node) &&
+          to_node->opcode() == HloOpcode::kParameter) {
         int64_t cluster_id = cluster_ids_.at(to_node->parent());
         add_hover_css_rule("clust", cluster_id, kRed);
       }
@@ -851,7 +856,8 @@ std::string HloDotDumper::DumpRootTag() {
 
 static const HloConstantInstruction* TryGetFusionParameterConstant(
     const HloInstruction* instr) {
-  if (instr->opcode() != HloOpcode::kParameter || !instr->IsFused()) {
+  if (instr->opcode() != HloOpcode::kParameter ||
+      !IsFusedWithParentFusionInstNotNull(instr)) {
     return nullptr;
   }
   const HloInstruction* fusion = instr->parent()->FusionInstruction();
@@ -881,7 +887,9 @@ bool HloDotDumper::ShouldMergeIntoUsers(const HloInstruction* instr) const {
   }
   const int kMinUsersToOmit = 3;
   return instr->opcode() == HloOpcode::kParameter && instr->shape().IsTuple() &&
-         !instr->IsFused() &&
+         // Treat as fused only when the parent fusion instruction exists to
+         // avoid misclassifying non-fusion parameters.
+         !IsFusedWithParentFusionInstNotNull(instr) &&
          absl::c_count_if(instr->users(),
                           [&](const HloInstruction* user) {
                             return filter_.Show(user);
@@ -1089,7 +1097,9 @@ std::string HloDotDumper::GetInstructionNodeInlinedOperands(
 
   // Special case: fused parameter is fed from a get-tuple-element.  If
   // so, name the tuple index.
-  if (instr->opcode() == HloOpcode::kParameter && instr->IsFused()) {
+  // Only access FusionInstruction when the parent fusion instruction exists.
+  if (instr->opcode() == HloOpcode::kParameter &&
+      IsFusedWithParentFusionInstNotNull(instr)) {
     const HloInstruction* param_input =
         instr->parent()->FusionInstruction()->operand(
             instr->parameter_number());
@@ -1113,7 +1123,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     if (it != sharding_colors_.end()) {
       return it->second;
     }
-    ColorScheme color = static_cast<ColorScheme>(
+    auto color = static_cast<ColorScheme>(
         kBlue + (next_shard_color_++ % (kDashedBorder - kBlue)));
     sharding_colors_.emplace(instr->sharding(), color);
     return color;
@@ -1140,9 +1150,14 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
   // (eg, parameter).
   switch (instr->opcode()) {
     case HloOpcode::kAbs:
+    case HloOpcode::kAsin:
+    case HloOpcode::kAsinh:
+    case HloOpcode::kAcos:
+    case HloOpcode::kAcosh:
     case HloOpcode::kAdd:
     case HloOpcode::kAnd:
     case HloOpcode::kAtan2:
+    case HloOpcode::kAtanh:
     case HloOpcode::kBitcastConvert:
     case HloOpcode::kCeil:
     case HloOpcode::kClamp:
@@ -1151,6 +1166,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kComplex:
     case HloOpcode::kConvert:
     case HloOpcode::kCos:
+    case HloOpcode::kCosh:
     case HloOpcode::kDivide:
     case HloOpcode::kErf:
     case HloOpcode::kExp:
@@ -1164,6 +1180,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kMaximum:
     case HloOpcode::kMinimum:
     case HloOpcode::kMultiply:
+    case HloOpcode::kMulhi:
     case HloOpcode::kNegate:
     case HloOpcode::kNot:
     case HloOpcode::kPopulationCount:
@@ -1187,6 +1204,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kLogistic:
     case HloOpcode::kSign:
     case HloOpcode::kSin:
+    case HloOpcode::kSinh:
     case HloOpcode::kSlice:
     case HloOpcode::kSort:
     case HloOpcode::kTopK:
@@ -1240,6 +1258,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kConvolution:
     case HloOpcode::kDot:
     case HloOpcode::kRaggedDot:
+    case HloOpcode::kScaledDot:
     case HloOpcode::kFft:
     case HloOpcode::kTriangularSolve:
     case HloOpcode::kCholesky:
@@ -1251,6 +1270,7 @@ ColorScheme HloDotDumper::GetInstructionColor(const HloInstruction* instr) {
     case HloOpcode::kBatchNormTraining:
     case HloOpcode::kReduce:
     case HloOpcode::kReduceWindow:
+    case HloOpcode::kScan:
     case HloOpcode::kScatter:  // scatter is a kind of reduction
     case HloOpcode::kSelectAndScatter:
     case HloOpcode::kGather:  // not a reduction, but goes with scatter
@@ -1339,8 +1359,8 @@ std::string HloDotDumper::GetInstructionNodeMetadata(
   }
   if (instr->metadata().stack_frame_id() != 0) {
     auto hlo_module = instr->parent()->parent();
-    int frame_id = instr->metadata().stack_frame_id();
-    while (frame_id != 0) {
+    StackFrameId frame_id{instr->metadata().stack_frame_id()};
+    while (frame_id.valid()) {
       HloModule::StackFrame frame = hlo_module->get_stack_frame(frame_id);
       if (frame.empty()) {
         break;
@@ -1427,7 +1447,7 @@ std::string HloDotDumper::GetInstructionNodeBackendConfig(
       props = ExtractCudnnConvBackendConfigProps(
           config->cudnn_conv_backend_config());
     }
-  } else if (gpu::IsCublasGemm(*instr)) {
+  } else if (gpu::IsCublasLtGemm(*instr)) {
     absl::StatusOr<gpu::GpuBackendConfig> config =
         instr->backend_config<gpu::GpuBackendConfig>();
     if (config.ok()) {
@@ -1620,7 +1640,9 @@ void HloDotDumper::AddInstructionIncomingEdges(const HloInstruction* instr) {
   // Add edges from instr's operands to instr.  Parameters within fusion
   // expressions are handled specially -- we draw an edge from the corresponding
   // operand on the fusion node itself to the parameter.
-  if (instr->opcode() == HloOpcode::kParameter && instr->IsFused()) {
+  // Only access FusionInstruction when the parent fusion instruction exists.
+  if (instr->opcode() == HloOpcode::kParameter &&
+      IsFusedWithParentFusionInstNotNull(instr)) {
     // Only add the edge if this is not the outermost computation; otherwise it
     // will lead from a node we're not drawing.
     if (instr->parent() != computation_) {
@@ -1682,8 +1704,9 @@ const HloInstruction* HloDotDumper::GetNodeForEdge(
 // implementation details.
 bool IsAcfPrameter(const xla::HloInstruction* instruction) {
   // Parameter is fused
+  // Require a real fusion parent to avoid nullptr FusionInstruction.
   if (instruction->opcode() != xla::HloOpcode::kParameter ||
-      !instruction->IsFused())
+      !IsFusedWithParentFusionInstNotNull(instruction))
     return false;
 
   // Parameter piped through and is only consumed by 1 user
@@ -1980,12 +2003,12 @@ static absl::StatusOr<std::string> CompressAndEncode(absl::string_view input) {
   auto gz_opts = tsl::io::ZlibCompressionOptions::GZIP();
   tsl::io::ZlibOutputBuffer gz_file(&f, gz_opts.input_buffer_size,
                                     gz_opts.output_buffer_size, gz_opts);
-  TF_RETURN_IF_ERROR(gz_file.Init());
-  TF_RETURN_IF_ERROR(gz_file.Append(input));
-  TF_RETURN_IF_ERROR(gz_file.Close());
+  RETURN_IF_ERROR(gz_file.Init());
+  RETURN_IF_ERROR(gz_file.Append(input));
+  RETURN_IF_ERROR(gz_file.Close());
 
   std::string encoded;
-  TF_RETURN_IF_ERROR(tsl::Base64Encode(compressed, &encoded));
+  RETURN_IF_ERROR(tsl::Base64Encode(compressed, &encoded));
   return absl::StrReplaceAll(encoded, {{"_", "/"}, {"-", "+"}});
 }
 
@@ -2016,8 +2039,8 @@ absl::StatusOr<std::string> WrapFusionExplorer(
                                  EscapeJSONString(p.to_highlight)));
       });
 
-  TF_ASSIGN_OR_RETURN(std::string dot_graphs_compressed,
-                      CompressAndEncode(dot_graphs));
+  ASSIGN_OR_RETURN(std::string dot_graphs_compressed,
+                   CompressAndEncode(dot_graphs));
 
   return absl::StrReplaceAll(
       R"wrapper(
@@ -2218,7 +2241,7 @@ static std::string GraphTitle(const HloComputation& computation) {
 
 absl::StatusOr<std::string> WrapFusionExplorer(
     const HloComputation& computation) {
-  absl::MutexLock lock(&fusion_visualizer_state_mu);
+  absl::MutexLock lock(fusion_visualizer_state_mu);
   const FusionVisualizerProgress& visualizer_progress =
       fusion_visualizer_states[FusionVisualizerStateKey(computation)];
   return WrapFusionExplorer(visualizer_progress, GraphTitle(computation));
@@ -2254,7 +2277,7 @@ static absl::StatusOr<std::string> WrapDotInFormat(
 
 void RegisterGraphToURLRenderer(
     std::function<absl::StatusOr<std::string>(absl::string_view)> renderer) {
-  absl::MutexLock lock(&url_renderer_mu);
+  absl::MutexLock lock(url_renderer_mu);
   if (url_renderer != nullptr) {
     LOG(WARNING) << "Multiple calls to RegisterGraphToURLRenderer. Last call "
                     "wins, but because order of initialization in C++ is "
@@ -2270,7 +2293,7 @@ void RegisterFusionState(const HloComputation& computation,
                          absl::string_view label,
                          const HloInstruction& consumer,
                          const HloInstruction* producer) {
-  absl::MutexLock lock(&fusion_visualizer_state_mu);
+  absl::MutexLock lock(fusion_visualizer_state_mu);
   FusionVisualizerProgress& fusion_progress =
       fusion_visualizer_states[FusionVisualizerStateKey(computation)];
 
@@ -2303,7 +2326,7 @@ absl::StatusOr<std::string> RenderGraph(
     HloRenderOptions hlo_render_options,
     std::optional<absl::flat_hash_map<const HloInstruction*, ColorStats>>
         color_map) {
-  absl::MutexLock lock(&url_renderer_mu);
+  absl::MutexLock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
     return Unavailable("Can't render as URL; no URL renderer was registered.");
   }
@@ -2360,7 +2383,7 @@ absl::StatusOr<std::string> RenderNeighborhoodAround(
     const absl::flat_hash_set<const HloInstruction*>& boundary,
     std::optional<absl::flat_hash_map<const HloInstruction*, ColorStats>>
         color_map) {
-  absl::MutexLock lock(&url_renderer_mu);
+  absl::MutexLock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
     return FailedPrecondition(
         "Can't render as URL; no URL renderer was registered.");
@@ -2380,7 +2403,7 @@ absl::StatusOr<std::string> RenderNeighborhoodAround(
 absl::StatusOr<std::string> RenderAllPathsFromTo(
     const HloInstruction& from, const HloInstruction& to, int64_t max_nodes,
     RenderedGraphFormat format, HloRenderOptions hlo_render_options) {
-  absl::MutexLock lock(&url_renderer_mu);
+  absl::MutexLock lock(url_renderer_mu);
   if (format == RenderedGraphFormat::kUrl && url_renderer == nullptr) {
     return FailedPrecondition(
         "Can't render as URL; no URL renderer was registered.");

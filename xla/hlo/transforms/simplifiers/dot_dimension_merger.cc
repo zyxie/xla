@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -129,36 +130,17 @@ class BatchDimensionMerger : public DfsHloRewriteVisitor {
           shifted_contracting_dimensions.end());
     }
 
-    // Update sparsity descriptors, if present.
-    auto sparsity = Cast<HloDotInstruction>(dot)->sparsity();
-    std::vector<SparsityDescriptor> new_sparsity(sparsity.begin(),
-                                                 sparsity.end());
-    std::vector<HloInstruction*> sparse_meta(sparsity.size());
-    for (int i = 0; i < sparsity.size(); ++i) {
-      SparsityDescriptor& descriptor = new_sparsity[i];
-      int64_t sparse_batch_dim =
-          descriptor.index() == 0 ? lhs_batch_dimension : rhs_batch_dimension;
-      if (descriptor.dimension() > sparse_batch_dim)
-        descriptor.set_dimension(descriptor.dimension() -
-                                 (batch_dimension_count - 1));
-      HloInstruction* meta =
-          dot->mutable_operand(HloDotInstruction::kOperands + i);
-      Shape new_meta_shape = merge_batch_dims(meta->shape(), sparse_batch_dim);
-      TF_ASSIGN_OR_RETURN(sparse_meta[i], MakeReshapeHlo(new_meta_shape, meta));
-    }
+    ASSIGN_OR_RETURN(HloInstruction * reshaped_lhs,
+                     MakeReshapeHlo(new_lhs_shape, dot->mutable_operand(0)));
 
-    TF_ASSIGN_OR_RETURN(HloInstruction * reshaped_lhs,
-                        MakeReshapeHlo(new_lhs_shape, dot->mutable_operand(0)));
-
-    TF_ASSIGN_OR_RETURN(HloInstruction * reshaped_rhs,
-                        MakeReshapeHlo(new_rhs_shape, dot->mutable_operand(1)));
+    ASSIGN_OR_RETURN(HloInstruction * reshaped_rhs,
+                     MakeReshapeHlo(new_rhs_shape, dot->mutable_operand(1)));
 
     Shape new_dot_shape = merge_batch_dims(dot->shape(), /*batch_dim=*/0);
     HloInstruction* new_dot = dot->parent()->AddInstruction(
         HloInstruction::CreateDot(new_dot_shape, reshaped_lhs, reshaped_rhs,
                                   new_dot_dimension_numbers,
-                                  dot->precision_config(), new_sparsity,
-                                  sparse_meta),
+                                  dot->precision_config()),
         &dot->metadata());
     dot->SetupDerivedInstruction(new_dot);
 
@@ -170,7 +152,7 @@ class BatchDimensionMerger : public DfsHloRewriteVisitor {
 
 }  // namespace
 
-absl::StatusOr<bool> DotDimensionMerger::Run(
+absl::StatusOr<bool> DotDimensionMerger::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   return BatchDimensionMerger().RunOnModule(module, execution_threads);

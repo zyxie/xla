@@ -29,12 +29,13 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_helpers.h"
+#include "xla/pjrt/c/pjrt_c_api_status_utils.h"
 #include "xla/tsl/platform/errors.h"
-#include "tsl/platform/platform.h"
 
 #if !defined(PLATFORM_WINDOWS)
 #include <dlfcn.h>
+
+#include "xla/tsl/platform/status_macros.h"
 #endif
 
 namespace pjrt {
@@ -70,6 +71,9 @@ absl::StatusOr<const PJRT_Api*> PjrtApi(absl::string_view device_type) {
 }
 
 absl::StatusOr<std::vector<std::string>> GetRegisteredPjrtApis() {
+  if (pjrt_apis == nullptr) {
+    return absl::FailedPreconditionError("PJRT_Api is not initialized.");
+  }
   std::vector<std::string> device_types;
   for (const auto& [device_type, api_and_initialized] : *pjrt_apis) {
     device_types.push_back(device_type);
@@ -109,18 +113,22 @@ absl::StatusOr<const PJRT_Api*> LoadPjrtPlugin(absl::string_view device_type,
   PjrtApiInitFn init_fn;
   *reinterpret_cast<void**>(&init_fn) = dlsym(library, "GetPjrtApi");
   if (init_fn == nullptr) {
+    dlclose(library);
     return absl::NotFoundError(
         absl::StrCat("GetPjrtApi not found in ", library_path));
   }
   LOG(INFO) << "GetPjrtApi was found for " << device_type << " at "
             << library_path;
   const PJRT_Api* api = init_fn();
-  TF_RETURN_IF_ERROR(SetPjrtApi(device_type, api));
+  RETURN_IF_ERROR(SetPjrtApi(device_type, api));
   return api;
 #endif
 }
 
 absl::StatusOr<bool> IsPjrtPluginInitialized(absl::string_view device_type) {
+  if (pjrt_apis == nullptr) {
+    return absl::FailedPreconditionError("PJRT_Api is not initialized.");
+  }
   std::string canonicalize_device_type = CanonicalizeDeviceType(device_type);
   auto iter = pjrt_apis->find(canonicalize_device_type);
   if (iter == pjrt_apis->end()) {

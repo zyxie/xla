@@ -36,7 +36,6 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
-#include "tsl/platform/logging.h"
 
 namespace xla {
 
@@ -75,7 +74,8 @@ HloValue::HloValue(HloValue::Id id, HloInstruction* instruction,
                    const ShapeIndex& index, bool is_phi)
     : BufferValue(instruction, index, id),
       uses_([this] { return ComputeUses(); }),
-      is_phi_(is_phi) {
+      is_phi_(is_phi),
+      live_out_of_module_(false) {
   // The defining position is always the first element in the positions_ vector.
   positions_.push_back(HloPosition{instruction, index});
 }
@@ -141,6 +141,7 @@ void HloValue::SetPositions(absl::Span<const HloPosition> positions) {
 
   // The positions must be unique and should not contain the defining position
   // as this is added at construction time.
+#ifndef NDEBUG
   for (const HloPosition& position_a : positions) {
     DCHECK_NE(position_a, defining_position());
     for (const HloPosition& position_b : positions) {
@@ -149,6 +150,7 @@ void HloValue::SetPositions(absl::Span<const HloPosition> positions) {
       }
     }
   }
+#endif  // NDEBUG
 
   positions_.insert(positions_.end(), positions.begin(), positions.end());
   // Update liveout status of this HloValue.
@@ -210,9 +212,10 @@ HloValue::Uses HloValue::ComputeUses() const {
 }
 
 bool HloValue::IsRootOf(const HloComputation* computation) const {
-  return absl::c_any_of(positions_, [&](const HloPosition& position) {
-    return position.instruction->IsRoot() &&
-           position.instruction->parent() == computation;
+  const HloInstruction* root = computation->root_instruction();
+
+  return absl::c_any_of(positions_, [root](const HloPosition& position) {
+    return position.instruction == root;
   });
 }
 

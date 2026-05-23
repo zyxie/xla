@@ -22,11 +22,15 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/casts.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
+#include "xla/backends/cpu/ffi.h"
+#include "xla/backends/cpu/nanort/nanort_client.h"
 #include "xla/backends/cpu/nanort/nanort_executable.h"
 #include "xla/core/host_offloading/host_offloading_buffer.h"
 #include "xla/core/host_offloading/host_offloading_executable.pb.h"
@@ -34,9 +38,11 @@ limitations under the License.
 #include "xla/core/host_offloading/host_offloading_pjrt_executable.h"
 #include "xla/ffi/ffi.h"
 #include "xla/ffi/ffi_api.h"
+#include "xla/hlo/builder/xla_computation.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
+#include "xla/service/cpu/cpu_aot_compilation_result.h"
 #include "xla/service/hlo_module_config.h"
 #include "xla/shape.h"
 #include "xla/shape_tree.h"
@@ -45,6 +51,7 @@ limitations under the License.
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test_benchmark.h"
+#include "xla/xla_data.pb.h"
 #include "tsl/platform/casts.h"
 
 namespace xla {
@@ -54,15 +61,29 @@ absl::StatusOr<std::unique_ptr<HostOffloadingExecutable>> CompileFromString(
     absl::string_view str,
     HostOffloadingExecutableProto::ExecutableType executable_type) {
   HloModuleConfig config;
-  TF_ASSIGN_OR_RETURN(auto module, ParseAndReturnUnverifiedModule(str));
+  ASSIGN_OR_RETURN(auto module, ParseAndReturnUnverifiedModule(str));
 
   HostOffloadingExecutableProto executable_proto;
   *executable_proto.mutable_hlo_module() = module->ToProto();
   executable_proto.set_executable_type(executable_type);
 
   switch (executable_type) {
-    case HostOffloadingExecutableProto::EXECUTABLE_TYPE_NANORT:
+    case HostOffloadingExecutableProto::EXECUTABLE_TYPE_NANORT: {
+      xla::cpu::NanoRtClient client;
+      XlaComputation computation(module->ToProto());
+      ASSIGN_OR_RETURN(auto executable, client.Compile(computation));
+      ASSIGN_OR_RETURN(auto aot_compilation_result,
+                       client.Export(executable.get()));
+
+      xla::cpu::CpuAotCompilationResult* cpu_aot_compilation_result =
+          absl::down_cast<cpu::CpuAotCompilationResult*>(
+              aot_compilation_result.get());
+
+      *executable_proto.mutable_aot_compilation_result() =
+          cpu_aot_compilation_result->proto();
       return HostOffloadingNanoRtExecutable::LoadFromProto(executable_proto);
+    }
+
     case HostOffloadingExecutableProto::EXECUTABLE_TYPE_PJRT:
       return HostOffloadingPjRtExecutable::LoadFromProto(executable_proto);
     default:
@@ -398,7 +419,7 @@ TEST_P(HostOffloadingRuntimeExecutableTest, FfiWithThreadpool) {
       auto computation,
       CompileFromString(hlo, host_offloading_executable_type));
 
-  Shape shape = ShapeUtil::MakeShape(xla::PrimitiveType::F32, {1});
+  Shape shape = ShapeUtil::MakeShape(xla::PrimitiveType::S32, {});
   auto result_literal = LiteralUtil::CreateR0<int32_t>(0);
 
   ShapeTree<HostOffloadingBuffer> result(
@@ -492,7 +513,7 @@ TEST(HostOffloadingNanortTest, DeviceAssignment) {
                         HostOffloadingExecutableProto::EXECUTABLE_TYPE_NANORT));
 
   auto host_offloading_nanort_executable =
-      tsl::down_cast<HostOffloadingNanoRtExecutable*>(computation.get());
+      absl::down_cast<HostOffloadingNanoRtExecutable*>(computation.get());
   ASSERT_NE(host_offloading_nanort_executable, nullptr);
   ASSERT_NE(host_offloading_nanort_executable->device_assignment(), nullptr);
 

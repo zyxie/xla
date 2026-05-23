@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/autotuner/autotuner.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/backends/autotuner/profiler.h"
@@ -39,21 +40,22 @@ limitations under the License.
 
 namespace xla::cpu {
 
-absl::StatusOr<bool> LlvmKernelAutotuner::Run(
+absl::StatusOr<bool> LlvmKernelAutotuner::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
-  TF_ASSIGN_OR_RETURN(auto compiler,
-                      CpuCodegenBackend::CreateBackendCompiler());
-  TF_ASSIGN_OR_RETURN(auto backend, LlvmKernelBackend::Create(compiler.get()));
-
+  ASSIGN_OR_RETURN(auto compiler, CpuCodegenBackend::CreateBackendCompiler());
+  ASSIGN_OR_RETURN(auto backend, LlvmKernelBackend::Create(compiler.get()));
   std::unique_ptr<Profiler> profiler = CpuProfiler::Create(ProfileOptions());
 
   std::vector<std::unique_ptr<CodegenBackend>> codegen_backends;
   codegen_backends.push_back(std::move(backend));
 
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<Autotuner> autotuner,
-                      Autotuner::Create(std::move(codegen_backends),
-                                        std::move(profiler), AutotuneConfig()));
+  AutotuneConfig autotune_config;
+  autotune_config.check_buffers = false;
+  ASSIGN_OR_RETURN(std::unique_ptr<Autotuner> autotuner,
+                   Autotuner::Create(std::move(codegen_backends),
+                                     std::move(profiler), autotune_config,
+                                     /*cache=*/nullptr));
 
   bool hlo_changed = false;
   for (HloComputation* computation : module->computations()) {

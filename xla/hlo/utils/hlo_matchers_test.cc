@@ -170,7 +170,7 @@ TEST_F(HloMatchersTest, ShardingMatcher) {
   p0->clear_sharding();
   auto p1 = HloInstruction::CreateParameter(1, ShapeUtil::MakeShape(F32, {7}),
                                             "param.1");
-  p1->set_sharding(HloSharding::AssignDevice(1));
+  p1->set_sharding(HloSharding::SingleDevice(1));
 
   auto tuple_shape = ShapeUtil::MakeTupleShape(
       {ShapeUtil::MakeShape(F32, {7}), ShapeUtil::MakeShape(S32, {9}),
@@ -179,29 +179,29 @@ TEST_F(HloMatchersTest, ShardingMatcher) {
   Array<int64_t> assignment({2});
   assignment.SetValues({0, 1});
   auto sharding = HloSharding::Tuple(
-      tuple_shape, {HloSharding::Tile(assignment), HloSharding::AssignDevice(1),
+      tuple_shape, {HloSharding::Tile(assignment), HloSharding::SingleDevice(1),
                     HloSharding::Replicate()});
   p2->set_sharding(sharding);
 
   EXPECT_THAT(p0.get(), op::NoSharding());
   EXPECT_THAT(p0.get(),
-              ::testing::Not(op::Sharding(HloSharding::AssignDevice(1))));
+              ::testing::Not(op::Sharding(HloSharding::SingleDevice(1))));
   EXPECT_THAT(p1.get(), ::testing::Not(op::NoSharding()));
   EXPECT_THAT(p1.get(),
-              ::testing::Not(op::Sharding(HloSharding::AssignDevice(0))));
-  EXPECT_THAT(p1.get(), op::Sharding(HloSharding::AssignDevice(1)));
+              ::testing::Not(op::Sharding(HloSharding::SingleDevice(0))));
+  EXPECT_THAT(p1.get(), op::Sharding(HloSharding::SingleDevice(1)));
 
   EXPECT_THAT(
       p2.get(),
       op::Sharding("{{devices=[2]0,1}, {maximal device=1}, {replicated}}"));
 
-  EXPECT_THAT(Explain(p0.get(), op::Sharding(HloSharding::AssignDevice(1))),
+  EXPECT_THAT(Explain(p0.get(), op::Sharding(HloSharding::SingleDevice(1))),
               "%param.0 = f32[5]{0} parameter(0) has no sharding (expected: "
               "{maximal device=1})");
   EXPECT_THAT(Explain(p1.get(), op::NoSharding()),
               "%param.1 = f32[7]{0} parameter(1), sharding={maximal device=1} "
               "expected to have no sharding.");
-  EXPECT_THAT(Explain(p1.get(), op::Sharding(HloSharding::AssignDevice(0))),
+  EXPECT_THAT(Explain(p1.get(), op::Sharding(HloSharding::SingleDevice(0))),
               "%param.1 = f32[7]{0} parameter(1), sharding={maximal device=1} "
               "has incorrect sharding (expected: {maximal device=0})");
 }
@@ -339,7 +339,7 @@ TEST_F(HloMatchersTest, ReplicaGroupsMatcher) {
   replica_groups[1].add_replica_ids(1);
   replica_groups[1].add_replica_ids(3);
   std::unique_ptr<HloInstruction> all_to_all = HloInstruction::CreateAllToAll(
-      shape, {p0.get()}, CollectiveDeviceList(replica_groups),
+      shape, {p0.get()}, std::make_shared<CollectiveDeviceList>(replica_groups),
       /*constrain_layout=*/false,
       /*channel_id=*/std::nullopt);
 
@@ -394,6 +394,21 @@ TEST_F(HloMatchersTest, MetadataMatcher) {
   actual_source_line.set_op_name("op_name1");
   actual_source_line.set_source_line(1);
 
+  OpMetadata actual_source_end_line;
+  actual_source_end_line.set_op_type("op_type1");
+  actual_source_end_line.set_op_name("op_name1");
+  actual_source_end_line.set_source_end_line(1);
+
+  OpMetadata actual_source_column;
+  actual_source_column.set_op_type("op_type1");
+  actual_source_column.set_op_name("op_name1");
+  actual_source_column.set_source_column(1);
+
+  OpMetadata actual_source_end_column;
+  actual_source_end_column.set_op_type("op_type1");
+  actual_source_end_column.set_op_name("op_name1");
+  actual_source_end_column.set_source_end_column(1);
+
   EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_opname)),
               HasSubstr("has wrong metadata (got op_name1, want op_name2)"));
   EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_source_file)),
@@ -405,8 +420,17 @@ TEST_F(HloMatchersTest, MetadataMatcher) {
   EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_source_line)),
               HasSubstr("has wrong metadata (got 0"
                         ", want 1)"));
+  EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_source_end_line)),
+              HasSubstr("has wrong metadata (got 0"
+                        ", want 1)"));
+  EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_source_column)),
+              HasSubstr("has wrong metadata (got 0"
+                        ", want 1)"));
+  EXPECT_THAT(Explain(p0.get(), op::Metadata(actual_source_end_column)),
+              HasSubstr("has wrong metadata (got 0"
+                        ", want 1)"));
   EXPECT_THAT(DescribeHloMatcher(op::Metadata(p0->metadata())),
-              R"( (metadata: op_type1 op_name1  0))");
+              R"( (metadata: op_type1 op_name1  0 0 0 0))");
 }
 }  // namespace
 }  // namespace xla

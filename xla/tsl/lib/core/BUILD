@@ -42,6 +42,8 @@ cc_library(
     deps = [
         "//xla/tsl/platform:status_matchers",
         "//xla/tsl/platform:test",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status:status_matchers",
     ],
 )
 

@@ -16,12 +16,14 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_GPU_SPMD_PIPELINE_H_
 #define XLA_SERVICE_GPU_GPU_SPMD_PIPELINE_H_
 
+#include <cstdint>
 #include <optional>
 
 #include "absl/functional/function_ref.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/hlo/transforms/simplifiers/algebraic_simplifier.h"
+#include "xla/stream_executor/device_description.h"
 
 namespace xla {
 namespace gpu {
@@ -33,7 +35,8 @@ void AddSPMDPasses(
     const se::GpuComputeCapability& compute_capability,
     HloPassPipeline& spmd_pipeline,
     std::optional<const absl::FunctionRef<void(HloPassPipeline&)>>
-        auto_sharding_func = std::nullopt);
+        auto_sharding_func = std::nullopt,
+    int64_t max_windowed_einsum_iteration = 32);
 
 }  // namespace gpu
 }  // namespace xla

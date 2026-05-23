@@ -27,11 +27,13 @@ cc_library(
         "trees.c",
         "trees.h",
         "uncompr.c",
-        "zconf.h",
         "zutil.c",
         "zutil.h",
     ],
-    hdrs = ["zlib.h"],
+    hdrs = [
+        "zconf.h",
+        "zlib.h",
+    ],
     copts = select({
         "@xla//xla/tsl:windows": [],
         "//conditions:default": [
@@ -40,4 +42,9 @@ cc_library(
         ],
     }),
     includes = ["."],
+)
+
+alias(
+    name = "zlib-ng",
+    actual = ":zlib",
 )

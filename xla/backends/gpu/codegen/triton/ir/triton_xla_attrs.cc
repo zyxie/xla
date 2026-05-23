@@ -14,8 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include "llvm/ADT/STLExtras.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OpDefinition.h"  // IWYU pragma: keep
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
@@ -27,7 +29,9 @@ static mlir::ParseResult parseI64ArrayAttr(mlir::AsmParser& parser,
                                            mlir::DenseI64ArrayAttr& array) {
   array = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
       mlir::DenseI64ArrayAttr::parse(parser, mlir::Type{}));
-  if (!array) return mlir::failure();
+  if (!array) {
+    return mlir::failure();
+  }
   return mlir::success();
 }
 

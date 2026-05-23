@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/conditional_simplifier.h"
 
+#include <cstdint>
 #include <iterator>
 #include <set>
 #include <string>
@@ -26,14 +27,17 @@ limitations under the License.
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_original_value_util.h"
 #include "xla/literal.h"
 #include "xla/service/call_graph.h"
 #include "xla/service/call_inliner.h"
+#include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/types.h"
@@ -107,6 +111,16 @@ absl::StatusOr<bool> TryRemoveUnusedConditionalOperands(
   param = new_computation->parameter_instruction(0);
   // Reset the parameter shape of the computation.
   *param->mutable_shape() = tuple_shape;
+  // Update original value if present.
+  if (computation->parameter_instruction(0)->original_value() != nullptr) {
+    absl::flat_hash_map<int64_t, int64_t> old_to_new_mapping;
+    for (int64_t i : tuple_indices_to_keep) {
+      old_to_new_mapping[i] = map[i];
+    }
+    CopyOriginalValue(computation->parameter_instruction(0),
+                      new_computation->parameter_instruction(0),
+                      old_to_new_mapping);
+  }
 
   // Reroute the GTE instructions to new tuple indices.
   for (HloInstruction* user : param->users()) {
@@ -138,7 +152,7 @@ absl::StatusOr<bool> TryRemoveUnusedConditionalOperands(
       }
       HloInstruction* new_tuple = conditional->parent()->AddInstruction(
           HloInstruction::CreateTuple(new_tuple_operands));
-      TF_RETURN_IF_ERROR(
+      RETURN_IF_ERROR(
           conditional->ReplaceOperandWithDifferentShape(branch + 1, new_tuple));
       CHECK(ShapeUtil::Compatible(conditional->operand(branch + 1)->shape(),
                                   conditional->branch_computation(branch)
@@ -300,6 +314,7 @@ bool RemoveUnusedTupleElements(HloInstruction* conditional_op) {
 
   // Replace the conditional instruction itself.
   *conditional_op->mutable_shape() = new_shape;
+  CopyOriginalValue(conditional_op, conditional_op, old_to_new_mapping);
 
   // Reroute all user GTE instructions to new tuple indices.
   for (HloInstruction* user : conditional_op->users()) {
@@ -460,13 +475,18 @@ absl::StatusOr<bool> ConditionalSimplifier::TryRemoveConditional(
         conditional->shape(), {conditional->mutable_operand(1 + branch)},
         conditional->branch_computation(branch)));
     conditional->SetupDerivedInstruction(call);
+    // Copy frontend attributes to the new call instruction.
+    call->set_frontend_attributes(conditional->frontend_attributes());
     return call;
   };
 
   if (conditional->branch_count() == 1) {
     HloInstruction* call_op = create_call(0);
-    TF_RETURN_IF_ERROR(computation->ReplaceInstruction(conditional, call_op));
-    TF_RETURN_IF_ERROR(CallInliner::Inline(call_op).status());
+    call_op->set_original_value(conditional->original_value());
+    RETURN_IF_ERROR(computation->ReplaceInstruction(conditional, call_op));
+    if (CallInliner::InlineInstructionAllowed(call_op)) {
+      RETURN_IF_ERROR(CallInliner::Inline(call_op).status());
+    }
     return true;
   }
 
@@ -481,8 +501,11 @@ absl::StatusOr<bool> ConditionalSimplifier::TryRemoveConditional(
       }
     }
     HloInstruction* call_op = create_call(branch_index);
-    TF_RETURN_IF_ERROR(computation->ReplaceInstruction(conditional, call_op));
-    TF_RETURN_IF_ERROR(CallInliner::Inline(call_op).status());
+    call_op->set_original_value(conditional->original_value());
+    RETURN_IF_ERROR(computation->ReplaceInstruction(conditional, call_op));
+    if (CallInliner::InlineInstructionAllowed(call_op)) {
+      RETURN_IF_ERROR(CallInliner::Inline(call_op).status());
+    }
 
     return true;
   }
@@ -527,7 +550,9 @@ absl::StatusOr<bool> ConditionalSimplifier::TryRemoveConditional(
   }
 
   HloInstruction* true_call_op = create_call(0);
+  true_call_op->set_original_value(conditional->original_value());
   HloInstruction* false_call_op = create_call(1);
+  false_call_op->set_original_value(conditional->original_value());
   auto condition_broadcast = [&](const Shape& shape) {
     if (ShapeUtil::IsScalar(shape)) {
       return conditional->mutable_operand(0);
@@ -565,11 +590,15 @@ absl::StatusOr<bool> ConditionalSimplifier::TryRemoveConditional(
             HloInstruction::CreateTuple(selects));
       };
 
-  TF_RETURN_IF_ERROR(computation->ReplaceInstruction(
+  RETURN_IF_ERROR(computation->ReplaceInstruction(
       conditional, select(true_call_op, false_call_op)));
 
-  TF_RETURN_IF_ERROR(CallInliner::Inline(false_call_op).status());
-  TF_RETURN_IF_ERROR(CallInliner::Inline(true_call_op).status());
+  if (CallInliner::InlineInstructionAllowed(false_call_op)) {
+    RETURN_IF_ERROR(CallInliner::Inline(false_call_op).status());
+  }
+  if (CallInliner::InlineInstructionAllowed(true_call_op)) {
+    RETURN_IF_ERROR(CallInliner::Inline(true_call_op).status());
+  }
   return true;
 }
 
@@ -602,11 +631,11 @@ static bool InstructionCallsChannelInstructions(
   return false;
 }
 
-absl::StatusOr<bool> ConditionalSimplifier::Run(
+absl::StatusOr<bool> ConditionalSimplifier::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   XLA_VLOG_LINES(
-      3, "ConditionalSimplifier::Run(), before:\n" + module->ToString());
+      3, "ConditionalSimplifier::RunImpl(), before:\n" + module->ToString());
   bool changed = false;
 
   // Gather all the conditional ops in our module. We do this ahead of time so
@@ -635,7 +664,7 @@ absl::StatusOr<bool> ConditionalSimplifier::Run(
     changed |= MergeDuplicateTupleElements(conditional_op);
     changed |= RemoveUnusedTupleElements(conditional_op);
     changed |= ReplaceRootWithEmptyTupleIfNoUsers(conditional_op);
-    TF_ASSIGN_OR_RETURN(bool result, TryRemoveConditional(conditional_op));
+    ASSIGN_OR_RETURN(bool result, TryRemoveConditional(conditional_op));
     if (result) {
       removed_conditionals.insert(conditional_op);
       changed = true;
@@ -665,13 +694,13 @@ absl::StatusOr<bool> ConditionalSimplifier::Run(
   for (auto* comp : calling_computationals_vector) {
     auto entry = calling_conditionals.find(comp);
     CHECK(entry != calling_conditionals.end());
-    TF_ASSIGN_OR_RETURN(bool result, TryRemoveUnusedConditionalOperands(
-                                         entry->first, entry->second));
+    ASSIGN_OR_RETURN(bool result, TryRemoveUnusedConditionalOperands(
+                                      entry->first, entry->second));
     changed |= result;
   }
 
-  XLA_VLOG_LINES(3,
-                 "ConditionalSimplifier::Run(), after:\n" + module->ToString());
+  XLA_VLOG_LINES(
+      3, "ConditionalSimplifier::RunImpl(), after:\n" + module->ToString());
   return changed;
 }
 

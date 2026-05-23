@@ -46,8 +46,9 @@ def LowerXlaSharedPass :
   }];
 
   let dependentDialects = [
-    "xla::XlaDialect",
+    "mlir::LLVM::LLVMDialect",
     "mlir::scf::SCFDialect",
+    "xla::XlaDialect",
   ];
 
   let constructor = "CreateLowerXlaSharedPass()";
@@ -101,8 +102,8 @@ def AddLoopUnrollFlagsPass : Pass<"xla-cpu-add-loop-unroll-flags", "mlir::func::
   ];
 
   let options = [
-    Option<"max_nested_bits_", "max_nested_bits", "int32_t", "256",
-           "The maximum number of bits accessed in a nested loop before disabling unrolling">,
+    Option<"max_nested_iterations_", "max_nested_iterations", "int32_t", "1",
+           "The maximum number of iterations accessed in a nested loop before disabling unrolling">,
   ];
 
   let constructor = "CreateAddLoopUnrollFlagsPass()";

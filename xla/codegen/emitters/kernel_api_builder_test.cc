@@ -20,6 +20,8 @@ limitations under the License.
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/hlo/analysis/indexing_map.h"
+#include "xla/hlo/analysis/symbolic_expr.h"
+#include "xla/hlo/analysis/symbolic_map.h"
 #include "xla/layout_util.h"
 #include "xla/runtime/work_cluster.h"
 #include "xla/runtime/work_dimensions.h"
@@ -33,8 +35,9 @@ namespace xla::emitters {
 namespace {
 
 TEST(DefaultWorkItemIndexingMap, MultiDimensionTile) {
-  mlir::MLIRContext context;
-  context.loadDialect<mlir::affine::AffineDialect>();
+  mlir::MLIRContext mlir_context;
+  RegisterSymbolicExprStorage(&mlir_context);
+  mlir_context.loadDialect<mlir::affine::AffineDialect>();
 
   WorkDimensions work_dimensions{NumWorkClusters{}, NumWorkGroups{2},
                                  NumWorkItems{3}, WorkTileSize{{4, 5, 6}}};
@@ -43,33 +46,36 @@ TEST(DefaultWorkItemIndexingMap, MultiDimensionTile) {
   *shape.mutable_layout() = LayoutUtil::GetDefaultLayoutForShape(shape);
 
   IndexingMap indexing_map =
-      GetDefaultWorkItemIndexingMap(work_dimensions, shape, &context);
+      GetDefaultWorkItemIndexingMap(work_dimensions, shape, &mlir_context);
 
   // The shape is the same as the number of elements work dimensions, so there
   // are no constraints.
   EXPECT_EQ(indexing_map.GetConstraintsCount(), 0);
 
-  // Chunk id and tile coordinates (1 + 3).
-  EXPECT_EQ(indexing_map.GetSymbolCount(), 4);
+  // Chunk id is unused so it is removed.
+  EXPECT_EQ(indexing_map.GetSymbolCount(), 3);
 
   // 6 dimensions: 3 work groups + 3 work items.
   EXPECT_EQ(indexing_map.GetDimensionCount(), 6);
 
-  mlir::AffineMap affine_map = indexing_map.GetAffineMap();
+  SymbolicMap symbolic_map = indexing_map.GetSymbolicMap();
 
-  mlir::AffineExpr work_item_sym = mlir::getAffineDimExpr(0, &context);
-  mlir::AffineExpr work_group_sym = mlir::getAffineDimExpr(3, &context);
+  SymbolicExpr work_item_sym = CreateDimExpr(0, &mlir_context);
+  SymbolicExpr work_group_sym = CreateDimExpr(3, &mlir_context);
 
-  EXPECT_EQ(affine_map.getResult(0), 3 * work_group_sym + work_item_sym);
+  EXPECT_EQ(symbolic_map.GetResult(0), work_group_sym * 3 + work_item_sym);
 
-  mlir::AffineExpr tile_sym_x = mlir::getAffineSymbolExpr(1, &context);
-  EXPECT_EQ(affine_map.getResult(1), tile_sym_x);
+  SymbolicExpr tile_sym_x =
+      CreateSymbolExpr(0, indexing_map.GetDimensionCount(), &mlir_context);
+  EXPECT_EQ(symbolic_map.GetResult(1), tile_sym_x);
 
-  mlir::AffineExpr tile_sym_y = mlir::getAffineSymbolExpr(2, &context);
-  EXPECT_EQ(affine_map.getResult(2), tile_sym_y);
+  SymbolicExpr tile_sym_y =
+      CreateSymbolExpr(1, indexing_map.GetDimensionCount(), &mlir_context);
+  EXPECT_EQ(symbolic_map.GetResult(2), tile_sym_y);
 
-  mlir::AffineExpr tile_sym_z = mlir::getAffineSymbolExpr(3, &context);
-  EXPECT_EQ(affine_map.getResult(3), tile_sym_z);
+  SymbolicExpr tile_sym_z =
+      CreateSymbolExpr(2, indexing_map.GetDimensionCount(), &mlir_context);
+  EXPECT_EQ(symbolic_map.GetResult(3), tile_sym_z);
 }
 
 }  // namespace

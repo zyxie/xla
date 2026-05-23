@@ -1,3 +1,5 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//xla:internal"],
@@ -17,6 +19,7 @@ cc_library(
         "//xla/tools:hlo_module_loader",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "//xla/tsl/util:command_line_flags",
         "@com_google_absl//absl/log",
@@ -39,7 +42,6 @@ cc_library(
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/analysis:alias_info",
-        "//xla/hlo/analysis:indexed_array_analysis",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass_pipeline",
         "//xla/hlo/tools/tests:hlo_opt_test_only_passes",
@@ -76,7 +78,6 @@ cc_library(
         "//xla/hlo/transforms/expanders:logistic_expander",
         "//xla/hlo/transforms/expanders:optimization_barrier_expander",
         "//xla/hlo/transforms/expanders:qr_expander",
-        "//xla/hlo/transforms/expanders:real_imag_expander",
         "//xla/hlo/transforms/expanders:reduce_decomposer",
         "//xla/hlo/transforms/expanders:reshape_decomposer",
         "//xla/hlo/transforms/expanders:rng_bit_generator_expander",
@@ -109,6 +110,7 @@ cc_library(
         "//xla/hlo/transforms/simplifiers:host_memory_transfer_asyncifier",
         "//xla/hlo/transforms/simplifiers:instruction_hoister",
         "//xla/hlo/transforms/simplifiers:optimize_input_output_buffer_alias",
+        "//xla/hlo/transforms/simplifiers:recognize_reduce_window",
         "//xla/hlo/transforms/simplifiers:reduce_window_rewriter",
         "//xla/hlo/transforms/simplifiers:reshape_mover",
         "//xla/hlo/transforms/simplifiers:result_caster",
@@ -125,6 +127,7 @@ cc_library(
         "//xla/service:float_support",
         "//xla/service:platform_util",
         "//xla/stream_executor/platform:initialize",
+        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",

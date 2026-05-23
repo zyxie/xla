@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -47,7 +48,7 @@ struct SplitDimSpec {
 };
 
 // A map from a partitioned offset to its corresponding partition ID.
-using OffsetToIdMap = absl::flat_hash_map<int64_t, int64_t>;
+using OffsetToIdMap = absl::btree_map<int64_t, int64_t>;
 
 // Represents the mapping of partition offsets to partition IDs for each replica
 // group. This can be derived from either a dynamic-slice or an all-gather
@@ -65,6 +66,13 @@ struct AllGatherDynamicSliceMatchSpec {
   PermutationPairs permutation_pairs;
 };
 
+// Function to map a replica/partition/global ID to an offset in the offset
+// table, based on the given scalar offset HLO. For example, if the HLO is
+// kPartitionId but the all-reduce uses global IDs, then the function maps
+// global IDs to partition IDs. It returns -1 if the HLO cannot be understood.
+using MapIdToTableOffset =
+    std::function<int64_t(const HloInstruction*, int64_t)>;
+
 // Matches the given all-reduce operation to a reduce-scatter pattern.
 std::optional<ReduceScatterSpec> MatchReduceScatter(
     const HloAllReduceInstructionBase* ar, int64_t num_partitions,
@@ -73,6 +81,24 @@ std::optional<ReduceScatterSpec> MatchReduceScatter(
     HloPredicate match_partition_id = HloPredicateIsOp<HloOpcode::kPartitionId>,
     HloPredicate match_replica_id = HloPredicateIsOp<HloOpcode::kReplicaId>,
     bool allow_intervening_bitcast = false);
+
+// The function checks if the dynamic-slice's offset matches the expected
+// pattern for local slicing. It supports two cases:
+//  1. Direct offset calculation: The offset is calculated as `partition_id *
+//  shard_size`, where `shard_size` is the size of each shard in the
+//  all-gather dimension. Calls IsPerIdOffset to check this pattern recursively
+//  because this offset might involve series of other instructions. For example,
+//  the partition_id can pass through convert or clamp. See BacktrackToBase for
+//  such possible patterns.
+//  2. Indirect offset calculation: The offset is calculated as `(partition_id
+//  * shard_size) + constant`, where `constant` is a constant value.
+//
+// If the dynamic-slice's offset matches either of these patterns, the function
+// returns true. Otherwise, it returns false.
+bool IsDynamicSlicingLocalDeviceFromAllGather(
+    HloInstruction* ds, HloAllGatherInstruction* all_gather,
+    int64_t num_partitions, int64_t num_replicas, bool is_cross_module,
+    bool use_global_device_ids);
 
 // Checks whether AG(ICI) and its user DS(ICI) can be canceled out.
 std::optional<ReduceScatterSpec> AllGatherDynamicSliceCancellation(
@@ -177,9 +203,67 @@ std::optional<PartitionOffsetSpec> GetIndicesSpecForDynamicSlice(
     const HloInstruction* absl_nonnull offset_hlo,
     const std::function<int64_t(const HloInstruction*, int64_t)>& map_id);
 
+// Extracts the mapping from slice offsets to partition IDs from a dynamic-slice
+// instruction that is fed by an all-gather where the dynamic-slice's offset
+// allows one multiply instruction.
+std::optional<PartitionOffsetSpec> GetIndicesSpecForDynamicSliceWithMultiply(
+    const HloAllGatherInstruction* absl_nonnull ag_instr,
+    const HloInstruction* absl_nonnull offset_hlo,
+    const std::function<int64_t(const HloInstruction*, int64_t)>& map_id,
+    int64_t split_dim_size);
+
 // Extracts the PartitionOffsetSpec from an all-gather instruction.
 std::optional<PartitionOffsetSpec> ExtractPartitionOffsetSpec(
     const HloAllGatherInstruction* ag, int64_t num_partitions);
+
+// Extracts pattern dynamic-slice(pad(all-gather)).
+// Returns true if the pattern is found, and set pad_hlo and ag_hlo.
+// Otherwise, returns false.
+bool MatchDsPadAllGather(HloInstruction* ds_hlo, HloInstruction** pad_hlo,
+                         HloInstruction** ag_hlo);
+
+// Find the canonical send/recv start op for one of send, recv, send-done, or
+// recv-done. For trivial cases send/recv and send-done/recv-done come in pairs
+// and the canonical start op is the send/recv op of the pair. If send/recv is
+// partially pipelined, we will use the send/recv leading into the while loop as
+// the canonical start op.
+//
+// Example:
+//   ```
+//   send_ctx = send(src, ...)  <-- canonical start op
+//   send_ctx_final = while(send_ctx) {
+//     send_ctx_in = parameter(0)
+//     send-done(send_ctx_in)
+//     ...
+//     ROOT send_ctx_out = send(next_src, ...)
+//   }
+//   send-done(send_ctx_final)
+// ```
+//
+const HloInstruction* FindCanonicalSendRecvStartOp(const HloInstruction* hlo);
+
+// Returns true if the instruction is a pipelined P2P send/recv with frontend
+// attribute.
+bool IsPipelinedP2P(const HloInstruction* instruction);
+
+// Analyzes the dynamic-slice offset pattern following an all-reduce and
+// constructs two sets of replica groups for DS-aware two-stage reduce-scatter
+// decomposition. Returns a pair of (outer_groups, inner_groups):
+//   - outer_groups (size=ds_factor): one device from each shard bucket,
+//     used for the first RS which scatters across shards.
+//   - inner_groups (size=local_group_size/ds_factor): all devices wanting
+//     the same shard, used for the second RS/AG within each shard bucket.
+//     Empty if inner_group_size == 1 (no second RS/AG needed).
+// Returns nullopt if the offset pattern cannot be resolved or if the
+// shard map is inconsistent with the replica groups.
+std::optional<std::pair<std::vector<ReplicaGroup>, std::vector<ReplicaGroup>>>
+BuildDSSplitReplicaGroups(
+    const HloChannelInstruction* instruction,
+    const HloInstruction* dynamic_slice, int64_t split_dim, int64_t ds_factor,
+    const std::vector<ReplicaGroup>& ici_replica_groups, int64_t num_partitions,
+    int64_t num_replicas, bool is_cross_module, bool use_global_device_ids,
+    HloPredicate match_partition_id = HloPredicateIsOp<HloOpcode::kPartitionId>,
+    HloPredicate match_replica_id = HloPredicateIsOp<HloOpcode::kReplicaId>);
 
 }  // namespace xla
 

@@ -16,18 +16,25 @@ limitations under the License.
 #ifndef XLA_BACKENDS_PROFILER_GPU_CUPTI_TRACER_H_
 #define XLA_BACKENDS_PROFILER_GPU_CUPTI_TRACER_H_
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "absl/status/status.h"
-#include "third_party/gpus/cuda/extras/CUPTI/include/cupti.h"
+#include "third_party/gpus/cuda/extras/CUPTI/include/cupti_activity.h"
+#include "third_party/gpus/cuda/extras/CUPTI/include/cupti_callbacks.h"
+#include "third_party/gpus/cuda/extras/CUPTI/include/cupti_driver_cbid.h"
+#include "third_party/gpus/cuda/include/cuda.h"
 #include "third_party/gpus/cuda/include/nvtx3/nvToolsExt.h"
+#include "xla/backends/profiler/gpu/cupti_buffer_events.h"
 #include "xla/backends/profiler/gpu/cupti_collector.h"
 #include "xla/backends/profiler/gpu/cupti_interface.h"
-#include "tsl/platform/types.h"
+#include "xla/backends/profiler/gpu/cupti_pm_sampler.h"
+#include "tsl/profiler/protobuf/xplane.pb.h"
 
 namespace xla {
 namespace profiler {
@@ -39,23 +46,34 @@ struct CuptiTracerOptions {
   // We only care CUPTI_CB_DOMAIN_DRIVER_API domain for now. It is kind of
   // redundant to have both CUPTI_CB_DOMAIN_DRIVER_API and
   // CUPTI_CB_DOMAIN_RUNTIME_API.
-  std::vector<CUpti_driver_api_trace_cbid_enum> cbids_selected;
+  std::vector<CUpti_driver_api_trace_cbid_enum> cbids_selected{};
   // Activity kinds to be collected using Activity API. If empty, the Activity
   // API is disable.
   std::vector<CUpti_ActivityKind> activities_selected;
   // Whether to call cuptiFinalize.
   bool cupti_finalize = false;
+  // Whether to prefer CUPTI V2 multi-subscriber APIs when available.
+  bool prefer_cupti_v2 = true;
   // Whether to call cuCtxSynchronize for each device before Stop().
   bool sync_devices_before_stop = false;
   // Whether to enable NVTX tracking, we need this for TensorRT tracking.
   bool enable_nvtx_tracking = false;
+  // PM sampling configuration (defaults are 2khz rate, 100ms decode)
+  // Only read during creation of a PM sampling object, later changes have
+  // no effect
+  CuptiPmSamplerOptions pm_sampler_options{};
+  // Whether to enable activity hardware events tracing using HES. see:
+  // https://docs.nvidia.com/cupti/release-notes/release-notes.html?highlight=cuptiActivityEnableHWTrace#updates-in-cuda-12-8
+  // This currently can not run second session with HES enabled, so do not turn
+  // on this. TODO(b/466437495): Remove this comment once the bug is fixed.
+  bool enable_activity_hardware_tracing = false;
 };
 
 class CuptiTracer;
 
 class CuptiDriverApiHook {
  public:
-  virtual ~CuptiDriverApiHook() {}
+  virtual ~CuptiDriverApiHook() = default;
 
   virtual absl::Status OnDriverApiEnter(
       int device_id, CUpti_CallbackDomain domain, CUpti_CallbackId cbid,
@@ -82,8 +100,12 @@ class CuptiTracer {
   bool IsAvailable() const;
   bool NeedRootAccess() const { return need_root_access_; }
 
-  absl::Status Enable(const CuptiTracerOptions& option,
-                      CuptiTraceCollector* collector);
+  // Enables the CUPTI tracer. XPlanes vector is optional and only needed when
+  // PM sampling is enabled to store sample metrics.
+  absl::Status Enable(
+      const CuptiTracerOptions& option, CuptiTraceCollector* collector,
+      const std::vector<std::unique_ptr<tensorflow::profiler::XPlane>>&
+          xplanes = {});
   void Disable();
 
   // Creates default CUPTI callback IDs to avoid empty set and enabling all
@@ -107,7 +129,7 @@ class CuptiTracer {
 
   absl::Status HandleCallback(CUpti_CallbackDomain domain,
                               CUpti_CallbackId cbid,
-                              const CUpti_CallbackData* callback_info);
+                              const CUpti_CallbackData* cbdata);
 
   // Returns a buffer and its size for CUPTI to store activities. This buffer
   // will be reclaimed when CUPTI makes a callback to ProcessActivityBuffer.
@@ -148,7 +170,7 @@ class CuptiTracer {
   // Buffer size and alignment, 32K and 8 as in CUPTI samples.
   static constexpr size_t kBufferSizeInBytes = 32 * 1024;
 
-  std::unique_ptr<CuptiActivityBufferManager> activity_buffers_;
+  std::unique_ptr<CuptiActivityBufferManager> activity_buffers_{};
   static_assert(std::atomic<size_t>::is_always_lock_free,
                 "std::atomic<size_t> is not lock free! This may cause very bad"
                 " profiling overhead in some circumstances.");
@@ -181,6 +203,7 @@ class CuptiTracer {
                                       const CUpti_CallbackData* cbdata);
   int num_gpus_;
   std::optional<CuptiTracerOptions> option_;
+  std::unique_ptr<xla::profiler::CuptiPmSampler> cupti_pm_sampler_;
   CuptiInterface* cupti_interface_ = nullptr;
   CuptiTraceCollector* collector_ = nullptr;
 
@@ -188,10 +211,12 @@ class CuptiTracer {
   bool need_root_access_ = false;
 
   bool api_tracing_enabled_ = false;
+  bool pm_sampling_enabled_ = false;
   // Cupti handle for driver or runtime API callbacks. Cupti permits a single
   // subscriber to be active at any time and can be used to trace Cuda runtime
   // as and driver calls for all contexts and devices.
   CUpti_SubscriberHandle subscriber_;  // valid when api_tracing_enabled_.
+  bool using_v2_subscriber_api_ = false;
 
   bool activity_tracing_enabled_ = false;
 

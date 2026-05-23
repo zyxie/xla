@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/container/node_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/cpu/collectives/cpu_clique.h"
 #include "xla/backends/cpu/collectives/cpu_clique_key.h"
 #include "xla/backends/cpu/collectives/cpu_collectives.h"
@@ -84,7 +85,7 @@ static void EraseProcessCpuCliques(CpuCollectives* collectives) {
   VLOG(3) << "Erase process CPU cliques for collectives: " << collectives;
   ProcessCpuCliques& cliques = GetProcessCpuCliques();
 
-  absl::MutexLock lock(&cliques.mu);
+  absl::MutexLock lock(cliques.mu);
   absl::erase_if(cliques.map, [collectives](const auto& entry) {
     return entry.first.first == collectives;
   });
@@ -99,9 +100,9 @@ absl::StatusOr<std::unique_ptr<Communicator>> CreateCommunicator(
 
   CpuCollectives::DeviceRank device_rank(/*device=*/nullptr, rank);
   CpuCollectives::Config config;
-  TF_ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Communicator>> communicators,
-                      collectives->CreateCommunicators(clique_key, std::nullopt,
-                                                       {device_rank}, config));
+  ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Communicator>> communicators,
+                   collectives->CreateCommunicators(clique_key, std::nullopt,
+                                                    {device_rank}, config));
 
   if (communicators.size() != 1) {
     // We expect to create communicators lazily, one at a time.
@@ -125,7 +126,7 @@ absl::StatusOr<Communicator*> AcquireCommunicator(
 
   // Synchronize access to the process cliques.
   ThreadSafeClique& thread_safe_clique = [&]() -> ThreadSafeClique& {
-    absl::MutexLock lock(&cliques.mu);
+    absl::MutexLock lock(cliques.mu);
     auto [it, emplaced] = cliques.map.try_emplace(
         std::make_pair(collectives, clique_key), clique_key);
 
@@ -144,7 +145,7 @@ absl::StatusOr<Communicator*> AcquireCommunicator(
   // Create the communicator, once.
   absl::once_flag* create_comm_once = nullptr;
   {
-    absl::MutexLock lock(&thread_safe_clique.mu);
+    absl::MutexLock lock(thread_safe_clique.mu);
     std::unique_ptr<absl::once_flag>& x =
         thread_safe_clique.create_comm_once[rank];
     if (!x) {
@@ -156,7 +157,7 @@ absl::StatusOr<Communicator*> AcquireCommunicator(
     absl::StatusOr<std::unique_ptr<Communicator>> comm =
         CreateCommunicator(collectives, clique_key, rank);
 
-    absl::MutexLock lock(&thread_safe_clique.mu);
+    absl::MutexLock lock(thread_safe_clique.mu);
     if (!comm.ok()) {
       thread_safe_clique.create_comm_status[rank] = comm.status();
       return;
@@ -167,8 +168,8 @@ absl::StatusOr<Communicator*> AcquireCommunicator(
     }
   });
 
-  absl::MutexLock lock(&thread_safe_clique.mu);
-  TF_RETURN_IF_ERROR(thread_safe_clique.create_comm_status[rank]);
+  absl::MutexLock lock(thread_safe_clique.mu);
+  RETURN_IF_ERROR(thread_safe_clique.create_comm_status[rank]);
   return *thread_safe_clique.clique.comm(rank);
 }
 

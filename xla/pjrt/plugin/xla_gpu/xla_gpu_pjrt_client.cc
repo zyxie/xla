@@ -19,7 +19,6 @@ limitations under the License.
 
 #include "absl/status/statusor.h"
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
-#include "xla/pjrt/gpu/tfrt/tfrt_gpu_client.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_gpu/xla_gpu_client_options.h"
 
@@ -27,9 +26,8 @@ namespace xla {
 
 absl::StatusOr<std::unique_ptr<PjRtClient>> GetXlaPjrtGpuClient(
     GpuClientOptions options) {
-  // TODO(masonchang): Wrap the GPU Client inside the PJRT Sandwich
   if (options.use_tfrt_gpu_client) {
-    return GetTfrtGpuClient(options);
+    options.use_async_dispatch = true;
   }
   return GetStreamExecutorGpuClient(options);
 }

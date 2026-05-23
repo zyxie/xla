@@ -25,7 +25,9 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/SymbolTable.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "xla/hlo/ir/hlo_original_value.h"
 #include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/shape.h"
@@ -114,10 +116,6 @@ mlir::ArrayAttr ConvertOutputOperandAliasing(
                                 std::pair<int64_t, xla::ShapeIndex>>>& aliaInfo,
     mlir::Builder* builder);
 
-// Converts the sparsity descriptor to attributes.
-absl::StatusOr<mlir::mhlo::SparsityDescriptorAttr> ConvertSparsityDescriptor(
-    xla::SparsityDescriptor sparsity_descriptor, mlir::Builder* builder);
-
 absl::StatusOr<mlir::mhlo::CustomCallApiVersion> ConvertCustomCallApiVersion(
     xla::CustomCallApiVersion api_version);
 
@@ -129,21 +127,31 @@ mlir::NamedAttribute ConvertChannelHandle(std::optional<int64_t> channel_id,
 mlir::NamedAttribute ConvertReplicaGroups(
     absl::Span<const ReplicaGroup> replica_groups, mlir::Builder* builder);
 
+// Converts the replica group attribute to a ReplicaGroupMeshAxesAttr if
+// applicable, otherwise falls back to DenseIntElementsAttr.
+mlir::NamedAttribute ConvertReplicaGroups(const HloInstruction* instruction,
+                                          mlir::SymbolTable* symbol_table,
+                                          mlir::OpBuilder* builder);
+
 mlir::NamedAttribute ConvertSourceTargetPairs(
     const std::vector<std::pair<int64_t, int64_t>>& source_target_pairs,
     mlir::Builder* builder);
 
 mlir::NamedAttribute ConvertUseGlobalDeviceIds(mlir::Builder* builder);
 
+// Converts the original value to an MLIR attribute.
+mlir::mhlo::OriginalValueAttr ConvertOriginalValue(
+    const xla::OriginalValue& original_value, mlir::Builder* builder);
+
 // Extracts layouts from shapes and converts it into layout attributes (array of
 // rank-1 index tensors). Returns an error if any of the shapes is a tuple.
 absl::StatusOr<mlir::ArrayAttr> ExtractLayoutsFromShapes(
-    const absl::Span<const Shape> shapes_with_layouts, mlir::Builder* builder);
+    absl::Span<const Shape> shapes_with_layouts, mlir::Builder* builder);
 
 // Extracts the layouts of each element from a tuple shape and returns them as
 // an array of rank-1 index tensors. Returns an error in presence of nested
 // tuple shapes.
-absl::StatusOr<mlir::ArrayAttr> ExtractLayoutsFromTuple(const xla::Shape shape,
+absl::StatusOr<mlir::ArrayAttr> ExtractLayoutsFromTuple(xla::Shape shape,
                                                         mlir::Builder* builder);
 
 }  // namespace xla

@@ -978,7 +978,7 @@ func.func @broadcast_bad_result_rank(%arg0: tensor<3xi32>) -> tensor<1x2x3xi32> 
 
 // -----
 
-func.func @broadcast_bad_first_part_result_shape(%arg0: tensor<3xi32>) -> tensor<1x2x3xi32> {
+func.func @broadcast_bad_first_part_result_shape(%arg0: tensor<3xi32>) -> tensor<1x3xi32> {
   // expected-error@+2 {{'mhlo.broadcast' op failed to infer returned types}}
   // expected-error@+1 {{'mhlo.broadcast' op inferred type(s) 'tensor<2x3xi32>' are incompatible with return type(s) of operation 'tensor<1x3xi32>'}}
   %0 = "mhlo.broadcast"(%arg0) <{broadcast_sizes = dense<[2]> : tensor<1xi64>}> : (tensor<3xi32>) -> tensor<1x3xi32>
@@ -987,7 +987,7 @@ func.func @broadcast_bad_first_part_result_shape(%arg0: tensor<3xi32>) -> tensor
 
 // -----
 
-func.func @broadcast_bad_second_part_result_shape(%arg0: tensor<3xi32>) -> tensor<1x2x3xi32> {
+func.func @broadcast_bad_second_part_result_shape(%arg0: tensor<3xi32>) -> tensor<2x1xi32> {
   // expected-error@+2 {{'mhlo.broadcast' op failed to infer returned types}}
   // expected-error@+1 {{'mhlo.broadcast' op inferred type(s) 'tensor<2x3xi32>' are incompatible with return type(s) of operation 'tensor<2x1xi32>'}}
   %0 = "mhlo.broadcast"(%arg0) <{broadcast_sizes = dense<[2]> : tensor<1xi64>}> : (tensor<3xi32>) -> tensor<2x1xi32>
@@ -1959,7 +1959,7 @@ func.func @rng_bit_generator(%arg0: tensor<2xui64>) -> (tensor<2xui64>, tensor<1
 
 // -----
 
-func.func @rng_bit_generator(%arg0: tensor<2xui64>) -> (tensor<2xui64>, tensor<10x12xui32>) {
+func.func @rng_bit_generator(%arg0: tensor<2xui64>) -> (tensor<3xui64>, tensor<10x12xui32>) {
   // expected-error@+1 {{output state shape must be compatible with initial state shape. Got: 'tensor<2xui64>' and 'tensor<3xui64>'}}
   %0, %1 = "mhlo.rng_bit_generator"(%arg0) <{rng_algorithm = #mhlo.rng_algorithm<DEFAULT>}> : (tensor<2xui64>) -> (tensor<3xui64>, tensor<10x12xui32>)
   func.return %0, %1 : tensor<3xui64>, tensor<10x12xui32>
@@ -3418,70 +3418,6 @@ func.func @dot_general_three_element_precision_config(%arg0: tensor<2x3x4xf32>, 
 
 // -----
 
-// CHECK-LABEL: func @sparse_dot
-func.func @sparse_dot(%arg0: tensor<2x16xf32>, %arg1: tensor<32x2xf32>, %meta: tensor<2x2xi16>) -> tensor<2x2xf32> {
-  %0 = "mhlo.sparse_dot"(%arg0, %arg1, %meta) {
-    lhs_sparsity = #mhlo.sparsity<dimension = 1, n = 2, m = 4>,
-    dot_dimension_numbers = #mhlo.dot<
-      lhs_batching_dimensions = [],
-      rhs_batching_dimensions = [],
-      lhs_contracting_dimensions = [1],
-      rhs_contracting_dimensions = [0]
-    >
-  } : (tensor<2x16xf32>, tensor<32x2xf32>, tensor<2x2xi16>) -> tensor<2x2xf32>
-  func.return %0 : tensor<2x2xf32>
-}
-
-// -----
-
-func.func @sparse_dot_incorrect_dimension(%arg0: tensor<2x16xf32>, %arg1: tensor<32x2xf32>, %meta: tensor<2x2xi16>) -> tensor<2x2xf32> {
-  // expected-error@+1 {{sparsity dimension is incorrect}}
-  %0 = "mhlo.sparse_dot"(%arg0, %arg1, %meta) {
-    lhs_sparsity = #mhlo.sparsity<dimension = 2, n = 2, m = 4>,
-    dot_dimension_numbers = #mhlo.dot<
-      lhs_batching_dimensions = [],
-      rhs_batching_dimensions = [],
-      lhs_contracting_dimensions = [1],
-      rhs_contracting_dimensions = [0]
-    >
-  } : (tensor<2x16xf32>, tensor<32x2xf32>, tensor<2x2xi16>) -> tensor<2x2xf32>
-  func.return %0 : tensor<2x2xf32>
-}
-
-// -----
-
-func.func @sparse_dot_incorrect_dimension(%arg0: tensor<2x16xf32>, %arg1: tensor<32x2xf32>, %meta: tensor<2x2xi16>) -> tensor<2x2xf32> {
-  // expected-error@+1 {{only 2:4 sparsity is supported}}
-  %0 = "mhlo.sparse_dot"(%arg0, %arg1, %meta) {
-    lhs_sparsity = #mhlo.sparsity<dimension = 1, n = 1, m = 4>,
-    dot_dimension_numbers = #mhlo.dot<
-      lhs_batching_dimensions = [],
-      rhs_batching_dimensions = [],
-      lhs_contracting_dimensions = [1],
-      rhs_contracting_dimensions = [0]
-    >
-  } : (tensor<2x16xf32>, tensor<32x2xf32>, tensor<2x2xi16>) -> tensor<2x2xf32>
-  func.return %0 : tensor<2x2xf32>
-}
-
-// -----
-
-func.func @sparse_dot(%arg0: tensor<2x32xf32>, %arg1: tensor<32x2xf32>, %meta: tensor<2x2xi16>) -> tensor<2x2xf32> {
-  // expected-error@+1 {{contracting dimension sizes must match for lhs/rhs}}
-  %0 = "mhlo.sparse_dot"(%arg0, %arg1, %meta) {
-    lhs_sparsity = #mhlo.sparsity<dimension = 1, n = 2, m = 4>,
-    dot_dimension_numbers = #mhlo.dot<
-      lhs_batching_dimensions = [],
-      rhs_batching_dimensions = [],
-      lhs_contracting_dimensions = [1],
-      rhs_contracting_dimensions = [0]
-    >
-  } : (tensor<2x32xf32>, tensor<32x2xf32>, tensor<2x2xi16>) -> tensor<2x2xf32>
-  func.return %0 : tensor<2x2xf32>
-}
-
-// -----
-
 func.func @compatible_shapes(%arg0: tensor<?xf32>, %shape: tensor<2xindex>) -> tensor<?x?xf32> {
   %0 = "mhlo.dynamic_reshape"(%arg0, %shape) : (tensor<?xf32>, tensor<2xindex>) -> tensor<?x?xf32>
   func.return %0 : tensor<?x?xf32>
@@ -3533,7 +3469,7 @@ func.func @bitcast_convert_complex(%arg: tensor<complex<f64>>) -> tensor<2xcompl
 
 // -----
 
-func.func @invalid_bitcast_convert_decomplex(%arg: tensor<2x4xcomplex<f32>>) -> tensor<2x4xf64> {
+func.func @invalid_bitcast_convert_decomplex(%arg: tensor<2x4xcomplex<f32>>) -> tensor<2x2xf64> {
   // expected-error@+1 {{cannot convert between real and complex types}}
   %0 = "mhlo.bitcast_convert"(%arg) : (tensor<2x4xcomplex<f32>>) -> tensor<2x2xf64>
   return %0 : tensor<2x2xf64>
@@ -7124,6 +7060,33 @@ func.func @composite_c4(%arg0: !mhlo.token) {
 
 // -----
 
+// CHECK-LABEL: func @scan
+func.func @scan(%input: tensor<10xf32>, %init: tensor<f32>) -> tensor<10xf32> {
+  %0:2 = mhlo.scan (%input) inits (%init) dimension=0 attributes {
+      scan_dim_size = 10 : i64, is_reverse = true, is_associative = true
+  } {
+  ^bb0(%input0: tensor<f32>, %carry0: tensor<f32>):
+    %1 = mhlo.add %input0, %carry0 : tensor<f32>
+    mhlo.return %1, %1 : tensor<f32>, tensor<f32>
+  } : (tensor<10xf32>, tensor<f32>) -> (tensor<10xf32>, tensor<f32>)
+  func.return %0#0 : tensor<10xf32>
+}
+
+// -----
+
+// CHECK-LABEL: func @scan_no_input_but_output
+func.func @scan_no_input_but_output(%init: tensor<f32>) -> tensor<10xf32> {
+  // The inferred return type has a dynamic dimension because there is no input.
+  // Check that this is compatible with the static dimension in the result type.
+  %0:2 = mhlo.scan () inits (%init) dimension=0 {
+  ^bb0(%carry0: tensor<f32>):
+    mhlo.return %carry0, %carry0 : tensor<f32>, tensor<f32>
+  } : (tensor<f32>) -> (tensor<10xf32>, tensor<f32>)
+  func.return %0#0 : tensor<10xf32>
+}
+
+// -----
+
 // ragged_dot mode 1: [b,m,k], [g,b,k,n], [g] -> [b,m,n]
 func.func @ragged_dot_non_contracting(%lhs : tensor<2x11x5xf32>, %rhs : tensor<3x2x5x7xf32>, %group_sizes : tensor<3xi64>) -> tensor<2x11x7xf32> {
   %0 = "mhlo.ragged_dot"(%lhs, %rhs, %group_sizes) {
@@ -7440,3 +7403,39 @@ func.func @ragged_dot_zero_rhs_group_dims_for_ragged_noncontracting(%lhs : tenso
   } : (tensor<11x5xf32>, tensor<5x7xf32>, tensor<3xi64>) -> tensor<11x7xf32>
   func.return %0 : tensor<11x7xf32>
 }
+
+// -----
+
+// CHECK-LABEL: func @mulhi_i32
+func.func @mulhi_i32(%arg0: tensor<4xi32>, %arg1: tensor<4xi32>) -> tensor<4xi32> {
+  %0 = "mhlo.mulhi"(%arg0, %arg1) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  func.return %0: tensor<4xi32>
+}
+
+// CHECK-LABEL: func @mulhi_i16
+func.func @mulhi_i16(%arg0: tensor<4xi16>, %arg1: tensor<4xi16>) -> tensor<4xi16> {
+  %0 = "mhlo.mulhi"(%arg0, %arg1) : (tensor<4xi16>, tensor<4xi16>) -> tensor<4xi16>
+  func.return %0: tensor<4xi16>
+}
+
+// -----
+// CHECK-LABEL: module @testOriginalArray
+module @testOriginalArray attributes {
+  // CHECK: mhlo.attr = #mhlo.original_array<"my_inst", [0, 1, 2]>
+  "mhlo.attr" = #mhlo.original_array<"my_inst", [0, 1, 2]>
+} {}
+
+// CHECK-LABEL: module @testOriginalValueElement
+module @testOriginalValueElement attributes {
+  // CHECK: mhlo.attr = #mhlo.original_value_element<[0], <"source_op", []>>
+  "mhlo.attr" = #mhlo.original_value_element<[0], <"source_op", []>>
+} {}
+
+// CHECK-LABEL: module @testOriginalValue
+module @testOriginalValue attributes {
+  // CHECK: mhlo.attr = #mhlo.original_value<false, [<[0], <"first_instruction", [0, 1]>>, <[1], <"second_instruction", [2]>>]>
+  "mhlo.attr" = #mhlo.original_value<false, [
+    <[0], <"first_instruction", [0, 1]>>,
+    <[1], <"second_instruction", [2]>>
+  ]>
+} {}

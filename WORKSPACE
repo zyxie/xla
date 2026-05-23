@@ -16,24 +16,42 @@ load(":workspace3.bzl", "xla_workspace3")
 
 xla_workspace3()
 
+# Initialize hermetic C++
+load("@rules_ml_toolchain//cc/deps:cc_toolchain_deps.bzl", "cc_toolchain_deps")
+
+cc_toolchain_deps()
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_sycl")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_rocm")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64")
+
+register_toolchains("@rules_ml_toolchain//cc:linux_aarch64_linux_aarch64_cuda")
+
 # Initialize hermetic Python
 load("//third_party/py:python_init_rules.bzl", "python_init_rules")
 
 python_init_rules()
 
-load("//third_party/py:python_init_repositories.bzl", "python_init_repositories")
+load("@rules_ml_toolchain//py:python_init_repositories.bzl", "python_init_repositories")
 
 python_init_repositories(
     requirements = {
         "3.11": "//:requirements_lock_3_11.txt",
+        "3.12": "//:requirements_lock_3_12.txt",
     },
 )
 
-load("//third_party/py:python_init_toolchains.bzl", "python_init_toolchains")
+load("@rules_ml_toolchain//py:python_register_toolchain.bzl", "python_register_toolchain")
 
-python_init_toolchains()
+python_register_toolchain()
 
-load("//third_party/py:python_init_pip.bzl", "python_init_pip")
+load("@rules_ml_toolchain//py:python_init_pip.bzl", "python_init_pip")
 
 python_init_pip()
 
@@ -54,7 +72,7 @@ load(":workspace0.bzl", "xla_workspace0")
 xla_workspace0()
 
 load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_json_init_repository.bzl",
+    "@rules_ml_toolchain//gpu/cuda:cuda_json_init_repository.bzl",
     "cuda_json_init_repository",
 )
 
@@ -66,13 +84,19 @@ load(
     "CUDNN_REDISTRIBUTIONS",
 )
 load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_redist_init_repositories.bzl",
+    "@rules_ml_toolchain//gpu/cuda:cuda_redist_init_repositories.bzl",
     "cuda_redist_init_repositories",
     "cudnn_redist_init_repository",
 )
+load(
+    "@rules_ml_toolchain//gpu/cuda:cuda_redist_versions.bzl",
+    "REDIST_VERSIONS_TO_BUILD_TEMPLATES",
+)
+load("//third_party/cccl:workspace.bzl", "CCCL_3_2_0_DIST_DICT", "CCCL_GITHUB_VERSIONS_TO_BUILD_TEMPLATES")
 
 cuda_redist_init_repositories(
-    cuda_redistributions = CUDA_REDISTRIBUTIONS,
+    cuda_redistributions = CUDA_REDISTRIBUTIONS | CCCL_3_2_0_DIST_DICT,
+    redist_versions_to_build_templates = REDIST_VERSIONS_TO_BUILD_TEMPLATES | CCCL_GITHUB_VERSIONS_TO_BUILD_TEMPLATES,
 )
 
 cudnn_redist_init_repository(
@@ -80,28 +104,28 @@ cudnn_redist_init_repository(
 )
 
 load(
-    "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_configure.bzl",
+    "@rules_ml_toolchain//gpu/cuda:cuda_configure.bzl",
     "cuda_configure",
 )
 
 cuda_configure(name = "local_config_cuda")
 
 load(
-    "@rules_ml_toolchain//third_party/nccl/hermetic:nccl_redist_init_repository.bzl",
+    "@rules_ml_toolchain//gpu/nccl:nccl_redist_init_repository.bzl",
     "nccl_redist_init_repository",
 )
 
 nccl_redist_init_repository()
 
 load(
-    "@rules_ml_toolchain//third_party/nccl/hermetic:nccl_configure.bzl",
+    "@rules_ml_toolchain//gpu/nccl:nccl_configure.bzl",
     "nccl_configure",
 )
 
 nccl_configure(name = "local_config_nccl")
 
 load(
-    "@rules_ml_toolchain//third_party/nvshmem/hermetic:nvshmem_json_init_repository.bzl",
+    "@rules_ml_toolchain//gpu/nvshmem:nvshmem_json_init_repository.bzl",
     "nvshmem_json_init_repository",
 )
 
@@ -112,7 +136,7 @@ load(
     "NVSHMEM_REDISTRIBUTIONS",
 )
 load(
-    "@rules_ml_toolchain//third_party/nvshmem/hermetic:nvshmem_redist_init_repository.bzl",
+    "@rules_ml_toolchain//gpu/nvshmem:nvshmem_redist_init_repository.bzl",
     "nvshmem_redist_init_repository",
 )
 
@@ -120,20 +144,12 @@ nvshmem_redist_init_repository(
     nvshmem_redistributions = NVSHMEM_REDISTRIBUTIONS,
 )
 
-load(
-    "@rules_ml_toolchain//third_party/nvshmem/hermetic:nvshmem_configure.bzl",
-    "nvshmem_configure",
-)
+# This is used for building nightly PJRT wheels.
+load("//build_tools/pjrt_wheels:nightly.bzl", "nightly_timestamp_repo")
 
-nvshmem_configure(name = "local_config_nvshmem")
+nightly_timestamp_repo(name = "nightly_timestamp")
 
-load(
-    "@rules_ml_toolchain//cc_toolchain/deps:cc_toolchain_deps.bzl",
-    "cc_toolchain_deps",
-)
+# This is used for building release candidate PJRT wheels.
+load("//build_tools/pjrt_wheels:release_candidate.bzl", "rc_number_repo")
 
-cc_toolchain_deps()
-
-register_toolchains("@rules_ml_toolchain//cc_toolchain:lx64_lx64")
-
-register_toolchains("@rules_ml_toolchain//cc_toolchain:lx64_lx64_cuda")
+rc_number_repo(name = "rc_number")

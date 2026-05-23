@@ -15,6 +15,7 @@ load(
     "@local_config_nccl//:generated_names.bzl",
     "GENERATED_SOURCES",
 )
+load("@rules_python//python:defs.bzl", "py_binary")
 
 licenses(["notice"])
 
@@ -22,9 +23,9 @@ exports_files(["LICENSE.txt"])
 
 NCCL_MAJOR = 2
 
-NCCL_MINOR = 26
+NCCL_MINOR = 29
 
-NCCL_PATCH = 5
+NCCL_PATCH = 7
 
 NCCL_VERSION = NCCL_MAJOR * 10000 + NCCL_MINOR * 100 + NCCL_PATCH  # e.g., 21605
 
@@ -175,7 +176,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "@local_config_cuda//cuda:cuda_headers",
-        "@xla//xla/tsl/cuda:nccl_stub",
+        "@xla//xla/tsl/cuda:nccl",
     ],
 )
 

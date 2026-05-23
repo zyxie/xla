@@ -28,6 +28,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/cpu/runtime/buffer_allocations.h"
 #include "xla/backends/cpu/runtime/function_library.h"
 #include "xla/backends/cpu/runtime/thread_pool_task_runner.h"
@@ -39,12 +40,14 @@ limitations under the License.
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/computation_placer.h"
+#include "xla/service/cpu/cpu_aot_loader.h"
 #include "xla/service/cpu/cpu_executable.h"
+#include "xla/service/cpu/executable.pb.h"
 #include "xla/service/executable.h"
 #include "xla/service/hlo_value.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/stream_executor/device_memory.h"
+#include "xla/stream_executor/device_address.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/logging.h"
@@ -77,7 +80,11 @@ static absl::StatusOr<std::vector<size_t>> ResolveArgumentsMapping(
   for (size_t i = 0; i < entry_layout.parameter_count(); ++i) {
     ShapeUtil::ForEachLeafShape(
         entry_layout.parameter_shape(i),
-        [&](const Shape&, const ShapeIndex& index) {
+        [&](const Shape& shape, const ShapeIndex& index) {
+          // Tokens are not backed by buffers, skip them.
+          if (shape.IsToken()) {
+            return;
+          }
           size_t arg_index = executable_arg_index.size();
           executable_arg_index[ArgumentIndex{i, index}] = arg_index;
         });
@@ -117,7 +124,11 @@ static absl::StatusOr<std::vector<size_t>> ResolveResultMapping(
   // Mapping from result index to flattened executable result index.
   absl::flat_hash_map<ShapeIndex, size_t> executable_res_index;
   ShapeUtil::ForEachLeafShape(entry_layout.result_shape(),
-                              [&](const Shape&, const ShapeIndex& index) {
+                              [&](const Shape& shape, const ShapeIndex& index) {
+                                // Tokens are not backed by buffers, skip them.
+                                if (shape.IsToken()) {
+                                  return;
+                                }
                                 size_t res_index = executable_res_index.size();
                                 executable_res_index[index] = res_index;
                               });
@@ -128,7 +139,7 @@ static absl::StatusOr<std::vector<size_t>> ResolveResultMapping(
 
   std::vector<size_t> result_to_allocation_index(executable_res_index.size());
 
-  TF_RETURN_IF_ERROR(ShapeUtil::ForEachLeafShapeWithStatus(
+  RETURN_IF_ERROR(ShapeUtil::ForEachLeafShapeWithStatus(
       entry_layout.result_shape(),
       [&](const Shape&, const ShapeIndex& index) -> absl::Status {
         // Skip buffer allocations assigned to non-leaf results (tuples).
@@ -144,9 +155,9 @@ static absl::StatusOr<std::vector<size_t>> ResolveResultMapping(
         }
 
         const HloValue* value = sources.values().front();
-        TF_ASSIGN_OR_RETURN(const BufferAllocation::Slice slice,
-                            buffer_assignment.GetUniqueSlice(
-                                value->instruction(), value->index()));
+        ASSIGN_OR_RETURN(const BufferAllocation::Slice slice,
+                         buffer_assignment.GetUniqueSlice(value->instruction(),
+                                                          value->index()));
 
         DCHECK_EQ(slice.size(), slice.allocation()->size())
             << "Result slice size must match result allocation size";
@@ -246,7 +257,7 @@ absl::StatusOr<std::unique_ptr<NanoRtExecutable>> NanoRtExecutable::Create(
   VLOG(3) << "Create NanoRtExecutable: name = " << module.name();
 
   // NanoRtExecutable requires a CPU executable with thunks.
-  auto* cpu_executable = tsl::down_cast<cpu::CpuExecutable*>(executable.get());
+  auto* cpu_executable = absl::down_cast<CpuExecutable*>(executable.get());
   if (cpu_executable == nullptr) {
     return Internal("NanoRtExecutable requires CPU executable");
   }
@@ -255,14 +266,14 @@ absl::StatusOr<std::unique_ptr<NanoRtExecutable>> NanoRtExecutable::Create(
   }
 
   // Mappings from argument/result index to buffer allocation index.
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       std::vector<size_t> argument_to_allocation_index,
       ResolveArgumentsMapping(module, cpu_executable->buffer_assignment()));
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       std::vector<size_t> result_to_allocation_index,
       ResolveResultMapping(module, cpu_executable->buffer_assignment()));
 
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       std::optional<size_t> temp_allocation_index,
       ResolveTempAllocationIndex(cpu_executable->buffer_assignment()));
 
@@ -281,6 +292,15 @@ absl::StatusOr<std::unique_ptr<NanoRtExecutable>> NanoRtExecutable::Create(
                            temp_allocation_index, program_shape));
 }
 
+absl::StatusOr<std::unique_ptr<NanoRtExecutable>> NanoRtExecutable::Create(
+    CompilationResultProto aot_compilation_result,
+    std::optional<ProgramShape> program_shape) {
+  ASSIGN_OR_RETURN(
+      std::unique_ptr<Executable> executable,
+      CpuAotLoader::LoadExecutable(std::move(aot_compilation_result)));
+  return Create(std::move(executable), program_shape);
+}
+
 NanoRtExecutable::NanoRtExecutable(
     std::unique_ptr<Executable> executable,
     std::vector<size_t> allocation_sizes,
@@ -295,23 +315,23 @@ NanoRtExecutable::NanoRtExecutable(
       temp_allocation_index_(temp_allocation_index),
       program_shape_(program_shape) {}
 
-static se::DeviceMemoryBase ToDeviceMemory(
+static se::DeviceAddressBase ToDeviceMemory(
     const NanoRtExecutable::Argument& argument) {
-  return se::DeviceMemoryBase(
+  return se::DeviceAddressBase(
       const_cast<void*>(reinterpret_cast<const void*>(argument.data().data())),
       argument.data().size());
 }
 
-static se::DeviceMemoryBase ToDeviceMemory(
+static se::DeviceAddressBase ToDeviceMemory(
     const NanoRtExecutable::Result& result) {
-  return se::DeviceMemoryBase(reinterpret_cast<void*>(result.data().data()),
-                              result.data().size());
+  return se::DeviceAddressBase(reinterpret_cast<void*>(result.data().data()),
+                               result.data().size());
 }
 
-static se::DeviceMemoryBase ToDeviceMemory(
+static se::DeviceAddressBase ToDeviceMemory(
     const NanoRtExecutable::PreallocatedTemp& temp) {
-  return se::DeviceMemoryBase(reinterpret_cast<void*>(temp.data()),
-                              temp.size());
+  return se::DeviceAddressBase(reinterpret_cast<void*>(temp.data()),
+                               temp.size());
 }
 
 tsl::AsyncValueRef<NanoRtExecutable::ExecuteEvent> NanoRtExecutable::Execute(
@@ -322,7 +342,7 @@ tsl::AsyncValueRef<NanoRtExecutable::ExecuteEvent> NanoRtExecutable::Execute(
                          {{"name", executable_->module().name()}});
   });
 
-  auto* executable = tsl::down_cast<cpu::CpuExecutable*>(executable_.get());
+  auto* executable = absl::down_cast<CpuExecutable*>(executable_.get());
 
   size_t num_arguments = argument_to_allocation_index_.size();
   size_t num_results = result_to_allocation_index_.size();
@@ -376,7 +396,7 @@ tsl::AsyncValueRef<NanoRtExecutable::ExecuteEvent> NanoRtExecutable::Execute(
     // vector of buffer allocations, and only allocations corresponding to
     // constants have a valid index.
     if (constant.index >= 0) {
-      buffers[constant.index] = constant.AsDeviceMemoryBase();
+      buffers[constant.index] = constant.AsDeviceAddress();
     }
   }
 
@@ -423,14 +443,16 @@ tsl::AsyncValueRef<NanoRtExecutable::ExecuteEvent> NanoRtExecutable::Execute(
         [execution_context = std::move(execution_context)] {});
 
     return execute_event;
-  } else {
-    cpu::BufferAllocations allocations(std::move(buffers));
-    Thunk::ExecuteParams execute_params{
-        executable->function_library(), &allocations,
-        /*xfeed=*/nullptr, options.intra_op_thread_pool(),
-        options.task_runner()};
-    return executable->thunks().Execute(execute_params);
   }
+
+  // If we are running without a thread pool, we can just create the
+  // ExecuteParams on the stack as thunks are guaranteed to be executed
+  // synchronously in the current thread.
+  cpu::BufferAllocations allocations(std::move(buffers));
+  Thunk::ExecuteParams execute_params{
+      executable->function_library(), &allocations,
+      /*xfeed=*/nullptr, options.intra_op_thread_pool(), options.task_runner()};
+  return executable->thunks().Execute(execute_params);
 }
 
 size_t NanoRtExecutable::temp_buffer_size() const {

@@ -19,16 +19,15 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
-#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
-using tsl::testing::IsOkAndHolds;
 
 class NeedsLayoutConversionTest : public HloHardwareIndependentTestBase {};
 
@@ -44,7 +43,7 @@ ENTRY main {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnUnverifiedModule(hlo_string));
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(false));
+              absl_testing::IsOkAndHolds(false));
 }
 
 TEST_F(NeedsLayoutConversionTest, NonElementWise) {
@@ -61,7 +60,7 @@ ENTRY dot {
                           ParseAndReturnUnverifiedModule(hlo_string));
   // Dot is not elementwise.
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(true));
+              absl_testing::IsOkAndHolds(true));
 }
 
 TEST_F(NeedsLayoutConversionTest, Tuple) {
@@ -76,7 +75,7 @@ ENTRY main {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnUnverifiedModule(hlo_string));
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(false));
+              absl_testing::IsOkAndHolds(false));
 }
 
 TEST_F(NeedsLayoutConversionTest, ScalarBroadcast) {
@@ -91,7 +90,7 @@ ENTRY main {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnUnverifiedModule(hlo_string));
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(false));
+              absl_testing::IsOkAndHolds(false));
 }
 
 TEST_F(NeedsLayoutConversionTest, NonScalarBroadcast) {
@@ -107,27 +106,42 @@ ENTRY main {
                           ParseAndReturnUnverifiedModule(hlo_string));
   // Non-scalar broadcast in column major -- must use layout conversion.
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(true));
+              absl_testing::IsOkAndHolds(true));
 }
 
 TEST_F(NeedsLayoutConversionTest, Call) {
   constexpr absl::string_view hlo_string = R"(
-HloModule m, entry_computation_layout={(bf16[8,512,128]{2,1,0})->f32[8,512,128]{2,1,0}}
+HloModule m, entry_computation_layout={(f32[8,512,128]{2,1,0})->f32[8,512,128]{2,1,0}}
 
 helper {
-  ROOT result = bf16[8,512,128]{2,1,0} parameter(0)
+  ROOT result = f32[8,512,128]{2,1,0} parameter(0)
 }
 
 ENTRY main {
-  arg0 = bf16[8,512,128]{2,1,0} parameter(0)
-  call = bf16[8,512,128]{2,1,0} call(arg0), to_apply=helper
+  arg0 = f32[8,512,128]{2,1,0} parameter(0)
+  call = f32[8,512,128]{2,1,0} call(arg0), to_apply=helper
   ROOT convert = f32[8,512,128]{2,1,0} convert(call)
 }
 )";
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnUnverifiedModule(hlo_string));
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(false));
+              absl_testing::IsOkAndHolds(false));
+}
+
+TEST_F(NeedsLayoutConversionTest, MixedElementTypes) {
+  constexpr absl::string_view hlo_string = R"(
+HloModule m, entry_computation_layout={(bf16[8,512,128]{2,1,0})->f32[8,512,128]{2,1,0}}
+
+ENTRY main {
+  arg0 = bf16[8,512,128]{2,1,0} parameter(0)
+  ROOT convert = f32[8,512,128]{2,1,0} convert(arg0)
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnUnverifiedModule(hlo_string));
+  EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
+              absl_testing::IsOkAndHolds(true));
 }
 
 TEST_F(NeedsLayoutConversionTest, PaddedTensor) {
@@ -143,7 +157,7 @@ ENTRY main {
                           ParseAndReturnUnverifiedModule(hlo_string));
   // The tiling used here creates padding, which requires layout conversion.
   EXPECT_THAT(HostOffloadingLayoutAnalysis::NeedsLayoutConversion(module.get()),
-              IsOkAndHolds(true));
+              absl_testing::IsOkAndHolds(true));
 }
 
 }  // namespace

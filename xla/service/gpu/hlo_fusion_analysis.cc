@@ -22,7 +22,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -31,7 +30,6 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "llvm/ADT/STLExtras.h"
 #include "xla/codegen/hlo_fusion_spec.h"
-#include "xla/codegen/ir_emission_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_traversal.h"
@@ -42,29 +40,11 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/stream_executor/device_description.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
 namespace {
-
-// Returns true if the fusion output contains non-strided slices only.
-bool IsInputFusibleNonStridedSlices(
-    const absl::Span<const HloInstructionAdaptor> fusion_roots) {
-  return absl::c_all_of(fusion_roots, [&](const HloInstructionAdaptor& root) {
-    return IsSliceWithUnitStrides(&root.instruction());
-  });
-}
-
-// Returns true if all slice inputs in a tuple are equal (ignoring type).
-bool AllSliceInputsAreCompatible(
-    const absl::Span<const HloInstructionAdaptor> fusion_roots) {
-  const Shape& first_slice_operand_shape =
-      fusion_roots[0].GetOperand(0).shape();
-  return absl::c_all_of(fusion_roots, [&](const HloInstructionAdaptor& slice) {
-    return ShapeUtil::EqualIgnoringElementType(slice.GetOperand(0).shape(),
-                                               first_slice_operand_shape);
-  });
-}
 
 // Returns a description of a transpose hero, that is compatible with all roots.
 //
@@ -91,7 +71,9 @@ std::optional<TransposeDescription> FindConsistentTransposeHero(
     }
   }
 
-  if (!tiled_transpose_hero) return std::nullopt;
+  if (!tiled_transpose_hero) {
+    return std::nullopt;
+  }
 
   for (auto* root : non_transpose_roots) {
     // Roots that don't have a transpose hero, should have a shape compatible
@@ -108,13 +90,21 @@ std::optional<TransposeDescription> FindConsistentTransposeHero(
 
 bool UseConcatenateFusion(absl::Span<const HloInstructionAdaptor> roots,
                           absl::Span<const HloInstructionAdaptor> heroes) {
-  if (heroes.size() != 1) return false;
-  if (heroes.front().opcode() != HloOpcode::kConcatenate) return false;
+  if (heroes.size() != 1) {
+    return false;
+  }
+  if (heroes.front().opcode() != HloOpcode::kConcatenate) {
+    return false;
+  }
   // The concat emitter does not support multiple outputs yet. TODO(csigg): fix.
-  if (roots.front().shape().IsTuple()) return false;
+  if (roots.front().shape().IsTuple()) {
+    return false;
+  }
   // Limit the number of operands because the concat emitter produces code for
   // each operand, hurting occupancy.
-  if (heroes.front().instruction().operand_count() > 4) return false;
+  if (heroes.front().instruction().operand_count() > 4) {
+    return false;
+  }
   // The loop emitter is faster when warp divergence and occupancy are both low.
   // TODO(csigg): exclude this case.
   return true;
@@ -132,7 +122,8 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
 
   if (fusion_backend_config.kind() == kTritonFusionKind ||
       fusion_backend_config.kind() == kTritonGemmFusionKind ||
-      fusion_backend_config.kind() == kTritonNestedGemmFusionKind) {
+      fusion_backend_config.kind() == kTritonNestedGemmFusionKind ||
+      fusion_backend_config.kind() == kTritonCollectiveFusionKind) {
     return HloFusionAnalysis::EmitterFusionKind::kTriton;
   }
 
@@ -185,15 +176,15 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(
   }
 
   if (fusion_roots.size() > 1) {
-    if (IsInputFusibleNonStridedSlices(fusion_roots) &&
-        AllSliceInputsAreCompatible(fusion_roots)) {
-      return HloFusionAnalysis::EmitterFusionKind::kInputSlices;
-    }
     return HloFusionAnalysis::EmitterFusionKind::kLoop;
   }
 
   if (fusion_roots[0].opcode() == HloOpcode::kScatter) {
     return HloFusionAnalysis::EmitterFusionKind::kScatter;
+  }
+
+  if (fusion_roots[0].opcode() == HloOpcode::kSort) {
+    return HloFusionAnalysis::EmitterFusionKind::kSort;
   }
 
   if (UseConcatenateFusion(fusion_roots, fusion_heroes)) {
@@ -225,6 +216,14 @@ int SmallestBitWidth(const Container& args) {
 }
 
 }  // namespace
+
+bool IsGpuFusionKind(const HloInstruction& hlo, absl::string_view kind) {
+  auto gpu_config = hlo.backend_config<GpuBackendConfig>();
+  if (!gpu_config.ok()) {
+    return false;
+  }
+  return gpu_config->fusion_backend_config().kind() == kind;
+}
 
 HloFusionAnalysis::HloFusionAnalysis(
     FusionBackendConfig fusion_backend_config, HloFusionSpec fusion_spec,

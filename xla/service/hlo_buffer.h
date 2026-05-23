@@ -16,14 +16,18 @@ limitations under the License.
 #ifndef XLA_SERVICE_HLO_BUFFER_H_
 #define XLA_SERVICE_HLO_BUFFER_H_
 
+#include <cstdint>
 #include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
+#include "xla/service/buffer_value.h"
 #include "xla/service/hlo_value.h"
-#include "xla/shape_tree.h"
-#include "xla/types.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
@@ -95,11 +99,22 @@ class HloBuffer {
 
   // Memory space color. Used to indicate the memory space that the hlo buffer
   // needs to live in.
-  BufferValue::Color color() const {
+  absl::StatusOr<BufferValue::Color> color() const {
     // Invariant: All values in the buffer should have the same color.
     BufferValue::Color result = values()[0]->color();
     for (const HloValue* value : values()) {
-      DCHECK_EQ(result, value->color());
+      if (result != value->color()) {
+        std::string details = absl::StrFormat(
+            "Not all HloValues in the HloBuffer have the same color. "
+            "Buffer id=%d has %d values:",
+            id(), values().size());
+        for (const HloValue* v : values()) {
+          absl::StrAppendFormat(&details, "\n  value %d color=%d defined at %s",
+                                v->id(), v->color(),
+                                v->defining_position().ToString());
+        }
+        return absl::FailedPreconditionError(details);
+      }
     }
     return result;
   }
@@ -113,7 +128,13 @@ class HloBuffer {
 
   std::vector<HloPosition> ComputePositions() const;
 
+  // Returns a human readable string of the HloBuffer. HloValues contained in
+  // the buffer are not represented in full.
   std::string ToString() const;
+
+  // Returns a human readable string of the HloBuffer. HloValues contained in
+  // the buffer are represented in full.
+  std::string ToDebugString() const;
 
   bool operator==(const HloBuffer& other) const;
   bool operator!=(const HloBuffer& other) const { return !(*this == other); }

@@ -45,35 +45,47 @@ cc_library(
     deps = [
         ":error_windows",
         ":wide_char",
+        "//xla/tsl/concurrency:executor",
         "//xla/tsl/platform:env_time",
         "//xla/tsl/platform:errors",
         "//xla/tsl/platform:file_statistics",
         "//xla/tsl/platform:logging",
         "//xla/tsl/platform:macros",
         "//xla/tsl/platform:status",
-        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:status_macros",
         "//xla/tsl/platform:threadpool_interface",
         "//xla/tsl/platform:types",
         "//xla/tsl/protobuf:error_codes_proto_impl_cc",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/functional:any_invocable",
-        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:cord",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@com_google_protobuf//:protobuf",
+        "@com_google_protobuf//:protobuf_lite",
         "@eigen_archive//:eigen3",
         "@tsl//tsl/platform",
         "@tsl//tsl/platform:blocking_counter",
         "@tsl//tsl/platform:context",
         "@tsl//tsl/platform:cord",
         "@tsl//tsl/platform:denormal",
-        "@tsl//tsl/platform:load_library",
-        "@tsl//tsl/platform:mutex",
         "@tsl//tsl/platform:path",
         "@tsl//tsl/platform:platform_port",
         "@tsl//tsl/platform:protobuf",
         "@tsl//tsl/platform:regexp",
+        "@tsl//tsl/platform:scanner",
         "@tsl//tsl/platform:setround",
-        "@tsl//tsl/platform:str_util",
         "@tsl//tsl/platform:strcat",
-        "@tsl//tsl/platform:stringpiece",
-        "@tsl//tsl/platform:stringprintf",
+        "@tsl//tsl/platform:thread_annotations",
         "@tsl//tsl/platform:tracing",
     ],
 )
@@ -82,14 +94,23 @@ cc_library(
     name = "env_impl",
     srcs = [
         "env.cc",
+        "//xla/tsl/platform:ram_file_system.h",
     ],
     tags = [
         "manual",
         "no_oss",
         "nobuilder",
+        "nofixdeps",
     ],
     deps = [
         ":env",
+        ":wide_char",
+        "//xla/tsl/platform:logging",
+        "//xla/tsl/protobuf:error_codes_proto_impl_cc",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@tsl//tsl/platform:load_library",
+        "@tsl//tsl/platform:mutex",
     ],
 )
 
@@ -101,9 +122,6 @@ cc_library(
         "manual",
         "no_oss",
         "nobuilder",
-    ],
-    deps = [
-        "//xla/tsl/platform:types",
     ],
 )
 
@@ -144,7 +162,6 @@ cc_library(
     ],
     deps = [
         ":wide_char",
-        "//xla/tsl/platform:errors",
         "@com_google_absl//absl/status",
     ],
 )
@@ -163,8 +180,11 @@ cc_library(
     ],
     deps = [
         ":error_windows",
-        "//xla/tsl/platform:errors",
         "//xla/tsl/platform:logging",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
     ],
 )
 
@@ -172,6 +192,7 @@ cc_library(
     name = "platform_port",
     srcs = [
         "port.cc",
+        "//xla/tsl/platform:numa_noop.cc",
         "@tsl//tsl/platform:cpu_info.cc",
     ],
     hdrs = [
@@ -179,6 +200,7 @@ cc_library(
         "@tsl//tsl/platform:demangle.h",
         "@tsl//tsl/platform:host_info.h",
         "@tsl//tsl/platform:init_main.h",
+        "@tsl//tsl/platform:macros.h",
         "@tsl//tsl/platform:mem.h",
         "@tsl//tsl/platform:numa.h",
         "@tsl//tsl/platform:snappy.h",
@@ -194,9 +216,16 @@ cc_library(
         "//xla/tsl/platform:byte_order",
         "//xla/tsl/platform:dynamic_annotations",
         "//xla/tsl/platform:logging",
+        "//xla/tsl/platform:macros",
         "//xla/tsl/platform:types",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
         "@snappy",
         "@tsl//tsl/platform",
+        "@tsl//tsl/platform:macros",
     ],
 )
 
@@ -209,7 +238,10 @@ cc_library(
         "no_oss",
         "nobuilder",
     ],
-    deps = ["@tsl//tsl/platform:mutex"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
+    ],
 )
 
 cc_library(
@@ -223,7 +255,8 @@ cc_library(
     ],
     deps = [
         "//xla/tsl/platform:types",
-        "@tsl//tsl/platform:mutex",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
         "@tsl//tsl/platform:stacktrace",
     ],
 )
@@ -236,6 +269,7 @@ cc_library(
         "manual",
         "no_oss",
         "nobuilder",
+        "nofixdeps",
     ],
     textual_hdrs = ["subprocess.h"],
     deps = [

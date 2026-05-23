@@ -24,12 +24,12 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/backends/interpreter/executable.h"
 #include "xla/backends/interpreter/platform_id.h"
 #include "xla/hlo/evaluator/hlo_evaluator.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/hlo/ir/hlo_module_group.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/hlo/transforms/expanders/cholesky_expander.h"
 #include "xla/hlo/transforms/expanders/dynamic_index_splitter.h"
@@ -49,9 +49,9 @@ limitations under the License.
 #include "xla/status_macros.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace interpreter {
@@ -113,7 +113,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> InterpreterCompiler::RunHloPasses(
     std::unique_ptr<HloModule> hlo_module, se::StreamExecutor* /*stream_exec*/,
     const CompileOptions& /*options*/) {
   VLOG(1) << "Run hlo passes on graph " << hlo_module->name();
-  TF_RETURN_IF_ERROR(RunHloOptimization(hlo_module.get()));
+  RETURN_IF_ERROR(RunHloOptimization(hlo_module.get()));
   return std::move(hlo_module);
 }
 
@@ -124,7 +124,7 @@ absl::StatusOr<std::unique_ptr<Executable>> InterpreterCompiler::RunBackend(
 
   VLOG(1) << "Run backend " << hlo_module->name();
 
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       DynamicDimensionInference dynamic_dimension_inference,
       DynamicDimensionInference::Run(
           hlo_module.get(),
@@ -147,35 +147,23 @@ absl::StatusOr<std::unique_ptr<Executable>> InterpreterCompiler::RunBackend(
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<Executable>>>
-InterpreterCompiler::Compile(
-    std::unique_ptr<HloModuleGroup> module_group,
-    std::vector<std::vector<se::StreamExecutor*>> stream_exec,
-    const CompileOptions& options) {
-  if (module_group->empty()) {
-    return std::vector<std::unique_ptr<Executable>>();
-  }
-  if (module_group->size() > 1) {
-    return tsl::errors::Unimplemented(
-        "Compilation of multiple HLO modules is not supported on Interpreter.");
-  }
-  if (stream_exec.size() != 1 || stream_exec[0].size() != 1) {
-    return tsl::errors::Unimplemented("Unexpected number of StreamExecutor's.");
-  }
-  auto hlo_modules = module_group->ConsumeModules();
-  TF_ASSIGN_OR_RETURN(auto module, RunHloPasses(std::move(hlo_modules[0]),
-                                                stream_exec[0][0], options));
-  TF_ASSIGN_OR_RETURN(auto executable, RunBackend(std::move(module),
-                                                  stream_exec[0][0], options));
+InterpreterCompiler::Compile(std::unique_ptr<HloModule> hlo_module,
+                             std::vector<se::StreamExecutor*> stream_exec,
+                             const CompileOptions& options) {
+  ASSIGN_OR_RETURN(
+      hlo_module, RunHloPasses(std::move(hlo_module), stream_exec[0], options));
+  ASSIGN_OR_RETURN(auto executable,
+                   RunBackend(std::move(hlo_module), stream_exec[0], options));
   std::vector<std::unique_ptr<Executable>> ret;
   ret.push_back(std::move(executable));
   return std::move(ret);
 }
 
-absl::StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>
+absl::StatusOr<std::vector<std::unique_ptr<CompiledModule>>>
 InterpreterCompiler::CompileAheadOfTime(
-    std::unique_ptr<HloModuleGroup> module_group,
+    std::unique_ptr<HloModule> hlo_module,
     const AotCompilationOptions& aot_options) {
-  return tsl::errors::InvalidArgument(
+  return absl::InvalidArgumentError(
       "AOT compilation not supported on Interpreter");
 }
 

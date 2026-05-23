@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <stdalign.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/array2d.h"
 #include "xla/backends/cpu/alignment.h"
 #include "xla/backends/cpu/nanort/nanort_executable.h"
@@ -41,11 +43,14 @@ limitations under the License.
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
+#include "xla/pjrt/c_api_client/pjrt_c_api_client.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
+#include "xla/pjrt/plugin/plugin_names.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/runtime/device_id.h"
 #include "xla/service/computation_placer.h"
+#include "xla/service/cpu/cpu_aot_compilation_result.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -54,6 +59,7 @@ limitations under the License.
 #include "xla/tsl/platform/test.h"
 #include "xla/tsl/platform/test_benchmark.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/casts.h"
 
 #define EIGEN_USE_THREADS
 
@@ -66,7 +72,26 @@ namespace {
 using Arguments = absl::InlinedVector<NanoRtExecutable::Argument, 8>;
 using Results = absl::InlinedVector<NanoRtExecutable::Result, 8>;
 
-TEST(NanoRtClientTest, ManagedTempAlignment) {
+absl::StatusOr<std::unique_ptr<NanoRtExecutable>> GetExecutable(
+    const XlaComputation& computation, bool export_executable) {
+  NanoRtClient client;
+  ASSIGN_OR_RETURN(std::unique_ptr<NanoRtExecutable> executable,
+                   client.Compile(computation));
+
+  if (export_executable) {
+    ASSIGN_OR_RETURN(auto exported, client.Export(executable.get()));
+    CpuAotCompilationResult* aot_compilation_result =
+        absl::down_cast<CpuAotCompilationResult*>(exported.get());
+    return NanoRtExecutable::Create(aot_compilation_result->proto(),
+                                    executable->program_shape());
+  }
+
+  return executable;
+}
+
+class NanoRtClientTest : public ::testing::TestWithParam<bool> {};
+
+TEST(NanoRtClientStandaloneTest, ManagedTempAlignment) {
   NanoRtExecutable::ManagedTemp<3> temp0(1);
   NanoRtExecutable::ManagedTemp<3> temp1(2);
   NanoRtExecutable::ManagedTemp<3> temp2(3);
@@ -78,7 +103,7 @@ TEST(NanoRtClientTest, ManagedTempAlignment) {
   EXPECT_EQ(reinterpret_cast<uintptr_t>(&temp3.data()[0]) % Align(), 0);
 }
 
-TEST(NanoRtClientTest, CompileAndRunScalarComputation) {
+TEST_P(NanoRtClientTest, CompileAndRunScalarComputation) {
   constexpr absl::string_view hlo = R"(
     HloModule add
 
@@ -92,9 +117,8 @@ TEST(NanoRtClientTest, CompileAndRunScalarComputation) {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   // Storage for executable parameters and results.
   alignas(32) float p0_value = 1.0f;
@@ -112,7 +136,7 @@ TEST(NanoRtClientTest, CompileAndRunScalarComputation) {
   EXPECT_EQ(r0_value, 3.0f);
 }
 
-TEST(NanoRtClientTest, CompileAndRunTupledComputation) {
+TEST_P(NanoRtClientTest, CompileAndRunTupledComputation) {
   constexpr absl::string_view hlo = R"(
     HloModule add_and_mul
 
@@ -129,9 +153,8 @@ TEST(NanoRtClientTest, CompileAndRunTupledComputation) {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   // Storage for executable parameters and results.
   alignas(32) float p0_value = 2.0f;
@@ -142,8 +165,9 @@ TEST(NanoRtClientTest, CompileAndRunTupledComputation) {
   // Prepare executable parameters, results and temp storage.
   Arguments arguments = {{&p0_value, 1}, {&p1_value, 1}};
   Results results = {{&r0_value, 1}, {&r1_value, 1}};
+  NanoRtExecutable::ManagedTemp<32> temp(executable->temp_buffer_size());
 
-  auto event = executable->Execute(arguments, results);
+  auto event = executable->Execute(arguments, results, temp);
   tsl::BlockUntilReady(event);
 
   ASSERT_TRUE(event.IsConcrete());
@@ -151,7 +175,7 @@ TEST(NanoRtClientTest, CompileAndRunTupledComputation) {
   EXPECT_EQ(r1_value, 6.0f);
 }
 
-TEST(NanoRtClientTest, CompileAndRunConstantComputation) {
+TEST_P(NanoRtClientTest, CompileAndRunConstantComputation) {
   absl::string_view hlo = R"(
     HloModule cst
 
@@ -163,9 +187,8 @@ TEST(NanoRtClientTest, CompileAndRunConstantComputation) {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   // Storage for executable results.
   alignas(32) float r0_value = 0.0f;
@@ -181,7 +204,7 @@ TEST(NanoRtClientTest, CompileAndRunConstantComputation) {
   EXPECT_EQ(r0_value, 42.0f);
 }
 
-TEST(NanoRtClientTest, CompileAndRunConditionalComputation) {
+TEST_P(NanoRtClientTest, CompileAndRunConditionalComputation) {
   absl::string_view hlo = R"(
     HloModule conditional
 
@@ -206,9 +229,8 @@ TEST(NanoRtClientTest, CompileAndRunConditionalComputation) {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   // Storage for executable parameters and results.
   alignas(32) int32_t p0_value = 0;
@@ -227,7 +249,7 @@ TEST(NanoRtClientTest, CompileAndRunConditionalComputation) {
   EXPECT_EQ(r0_value, 8.0f);
 }
 
-TEST(NanoRtClientTest, CompileAndRunModelWithThreadPool) {
+TEST_P(NanoRtClientTest, CompileAndRunModelWithThreadPool) {
   // Implements matmul(A, C) + matmul(B, C)
   absl::string_view hlo = R"(
     HloModule test_module
@@ -244,9 +266,8 @@ ENTRY test_module {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   xla::Literal first_literal =
       LiteralUtil::CreateR2FromArray2D<float>(Array2D<float>(1024, 4096, 1.0f));
@@ -285,7 +306,7 @@ ENTRY test_module {
   EXPECT_EQ(result_span[0], expected_result);
 }
 
-TEST(NanoRtClientTest, CompileAndRunPartitionAndReplicaIdInstructions) {
+TEST_P(NanoRtClientTest, CompileAndRunPartitionAndReplicaIdInstructions) {
   constexpr absl::string_view hlo = R"(
     HloModule replica-and-partition-id
 
@@ -299,9 +320,8 @@ ENTRY ReplicaAndPartitionId {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   ComputationPlacer computation_placer;
   constexpr int kReplicaCount = 2;
@@ -360,7 +380,7 @@ XLA_FFI_DEFINE_HANDLER(kAdd, Add,
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "__xla_nanort_test$$add", "Host",
                          kAdd);
 
-TEST(NanoRtClientTest, CustomCallTest) {
+TEST_P(NanoRtClientTest, CustomCallTest) {
   const char* kModuleStr = R"(
     HloModule module
 
@@ -376,9 +396,8 @@ TEST(NanoRtClientTest, CustomCallTest) {
                           ParseAndReturnUnverifiedModule(kModuleStr));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
 
   int32_t a = 1.0f;
   int32_t b = 2.0f;
@@ -403,7 +422,7 @@ TEST(NanoRtClientTest, CustomCallTest) {
   EXPECT_EQ(result, 3.0f);
 }
 
-TEST(NanoRtClientTest, ProgramShapeTestInt4) {
+TEST_P(NanoRtClientTest, ProgramShapeTestInt4) {
   constexpr absl::string_view kModuleStr = R"(
     HloModule int4_function
 
@@ -418,9 +437,8 @@ TEST(NanoRtClientTest, ProgramShapeTestInt4) {
                           ParseAndReturnUnverifiedModule(kModuleStr));
   XlaComputation computation(module->ToProto());
 
-  NanoRtClient client;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
-                          client.Compile(computation));
+                          GetExecutable(computation, GetParam()));
   ASSERT_TRUE(executable->program_shape().has_value());
 
   auto program_shape = executable->program_shape();
@@ -433,6 +451,41 @@ TEST(NanoRtClientTest, ProgramShapeTestInt4) {
   EXPECT_EQ(
       executable->program_shape()->result().layout().element_size_in_bits(), 4);
 }
+
+TEST_P(NanoRtClientTest, ProgramShapeKeepsLayout) {
+  constexpr absl::string_view kModuleStr = R"(
+    HloModule layout_test
+
+    ENTRY %main.4 (Arg_0.1: f32[3,3], Arg_1.2: f32[3,3]) -> f32[3,3] {
+      %Arg_0.1 = f32[3,3]{0,1} parameter(0)
+      %Arg_1.2 = f32[3,3]{0,1} parameter(1)
+      ROOT %add.3 = f32[3,3]{0,1} add(%Arg_0.1, %Arg_1.2)
+    }
+)";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,
+                          ParseAndReturnUnverifiedModule(kModuleStr));
+  XlaComputation computation(hlo_module->ToProto());
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<NanoRtExecutable> executable,
+                          GetExecutable(computation, GetParam()));
+  ASSERT_TRUE(executable->program_shape().has_value());
+
+  auto program_shape = executable->program_shape();
+
+  for (size_t i = 0; i < program_shape->parameters_size(); ++i) {
+    EXPECT_EQ(program_shape->parameters()[i].layout().minor_to_major(),
+              absl::Span<const int64_t>({0, 1}));
+  }
+  EXPECT_EQ(program_shape->result().layout().minor_to_major(),
+            absl::Span<const int64_t>({0, 1}));
+}
+
+INSTANTIATE_TEST_SUITE_P(NanoRtClientTestSuite, NanoRtClientTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? "EXPORT" : "NO_EXPORT";
+                         });
 
 //===----------------------------------------------------------------------===//
 // Performance benchmarks below
@@ -528,8 +581,11 @@ BENCHMARK_CAPTURE(BM_NanoRtFibonacci, no_thread_pool, std::nullopt);
 BENCHMARK_CAPTURE(BM_NanoRtFibonacci, thread_pool,
                   std::make_optional<Eigen::ThreadPool>(2));
 
-static void BM_PjRtAddScalars(benchmark::State& state) {
-  auto client = GetXlaPjrtCpuClient(/*options=*/{});
+static void BM_PjRtAddScalars(benchmark::State& state,
+                              bool use_c_api_sandwich) {
+  auto client = use_c_api_sandwich
+                    ? xla::GetCApiClient(kCpuPjrtName, /*create_options=*/{})
+                    : GetXlaPjrtCpuClient(/*options=*/{});
   PjRtDevice* device = (*client)->devices().front();
   PjRtMemorySpace* memory_space = *device->default_memory_space();
 
@@ -560,10 +616,13 @@ static void BM_PjRtAddScalars(benchmark::State& state) {
   }
 }
 
-BENCHMARK(BM_PjRtAddScalars);
+BENCHMARK_CAPTURE(BM_PjRtAddScalars, Direct, false);
+BENCHMARK_CAPTURE(BM_PjRtAddScalars, CSandwich, true);
 
-static void BM_PjRtFibonacci(benchmark::State& state) {
-  auto client = GetXlaPjrtCpuClient(/*options=*/{});
+static void BM_PjRtFibonacci(benchmark::State& state, bool use_c_api_sandwich) {
+  auto client = use_c_api_sandwich
+                    ? xla::GetCApiClient(kCpuPjrtName, /*create_options=*/{})
+                    : GetXlaPjrtCpuClient(/*options=*/{});
   PjRtDevice* device = (*client)->devices().front();
   PjRtMemorySpace* memory_space = *device->default_memory_space();
 
@@ -594,7 +653,8 @@ static void BM_PjRtFibonacci(benchmark::State& state) {
   }
 }
 
-BENCHMARK(BM_PjRtFibonacci);
+BENCHMARK_CAPTURE(BM_PjRtFibonacci, Direct, false);
+BENCHMARK_CAPTURE(BM_PjRtFibonacci, CSandwich, true);
 
 }  // namespace
 }  // namespace xla::cpu

@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/backends/cpu/codegen/jit_compiler.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/base/thread_annotations.h"
@@ -25,24 +27,31 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/status_macros.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/DylibManager.h"
 #include "llvm/ExecutionEngine/Orc/ExecutorProcessControl.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
 #include "llvm/ExecutionEngine/Orc/InProcessMemoryAccess.h"
+#include "llvm/ExecutionEngine/Orc/MemoryAccess.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
+#include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/ExecutionEngine/Orc/TaskDispatch.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Host.h"
 #include "xla/backends/cpu/codegen/execution_engine.h"
 #include "xla/backends/cpu/codegen/ir_compiler.h"
 #include "xla/backends/cpu/codegen/object_loader.h"
 #include "xla/backends/cpu/runtime/function_library.h"
+#include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "tsl/profiler/lib/traceme.h"
@@ -53,16 +62,13 @@ namespace xla::cpu {
 namespace {
 // TODO: move to ExecutorProcessControl-based APIs.
 class UnsupportedExecutorProcessControl
-    : public llvm::orc::ExecutorProcessControl,
-      private llvm::orc::InProcessMemoryAccess {
+    : public llvm::orc::ExecutorProcessControl {
  public:
   explicit UnsupportedExecutorProcessControl(
       std::unique_ptr<llvm::orc::TaskDispatcher> Dispatcher)
       : ExecutorProcessControl(std::make_shared<llvm::orc::SymbolStringPool>(),
-                               std::move(Dispatcher)),
-        InProcessMemoryAccess(llvm::Triple("").isArch64Bit()) {
+                               std::move(Dispatcher)) {
     this->TargetTriple = llvm::Triple("");
-    this->MemAccess = this;
   }
 
   llvm::Expected<int32_t> runAsMain(llvm::orc::ExecutorAddr MainFnAddr,
@@ -87,6 +93,22 @@ class UnsupportedExecutorProcessControl
   }
 
   llvm::Error disconnect() override { return llvm::Error::success(); }
+
+  llvm::Expected<std::unique_ptr<llvm::orc::DylibManager>>
+  createDefaultDylibMgr() override {
+    llvm_unreachable("Unsupported");
+  }
+
+  llvm::Expected<std::unique_ptr<llvm::jitlink::JITLinkMemoryManager>>
+  createDefaultMemoryManager() override {
+    llvm_unreachable("Unsupported");
+  }
+
+  llvm::Expected<std::unique_ptr<llvm::orc::MemoryAccess>>
+  createDefaultMemoryAccess() override {
+    return std::make_unique<llvm::orc::InProcessMemoryAccess>(
+        this->TargetTriple.isArch64Bit());
+  }
 };
 }  // namespace
 
@@ -96,8 +118,8 @@ using tsl::profiler::TraceMeEncode;
 absl::StatusOr<JitCompiler> JitCompiler::Create(
     Options options, std::unique_ptr<IrCompiler> ir_compiler,
     TaskRunner task_runner) {
-  TF_ASSIGN_OR_RETURN(std::unique_ptr<llvm::TargetMachine> target_machine,
-                      ir_compiler->build_target_machine());
+  ASSIGN_OR_RETURN(std::unique_ptr<llvm::TargetMachine> target_machine,
+                   ir_compiler->build_target_machine());
 
   // Dispatch compilation tasks using the provided task runner.
   auto task_dispatcher =
@@ -168,8 +190,8 @@ absl::Status JitCompiler::AddModule(llvm::orc::ThreadSafeModule module,
   });
 
   // Add module to the selected dynamic library.
-  TF_ASSIGN_OR_RETURN(llvm::orc::JITDylib * dylib,
-                      execution_engine_->dylib(dylib_index));
+  ASSIGN_OR_RETURN(llvm::orc::JITDylib * dylib,
+                   execution_engine_->dylib(dylib_index));
   if (auto err = compile_layer_->add(*dylib, std::move(module))) {
     return Internal("Failed to add module to dylib %d: %s", dylib_index,
                     llvm::toString(std::move(err)));
@@ -184,13 +206,17 @@ absl::StatusOr<std::unique_ptr<FunctionLibrary>> JitCompiler::Compile(
     return TraceMeEncode("JitCompiler::Compile",
                          {{"num_symbols", symbols.size()}});
   });
+
   ObjectLoader object_loader(std::move(execution_engine_));
-  llvm::DataLayout data_layout = target_machine_->createDataLayout();
-  TF_ASSIGN_OR_RETURN(auto symbol_map, object_loader.LookupSymbols(symbols));
-  // Wait for all compilation tasks to finish.
+  auto symbol_map = object_loader.LookupSymbols(symbols);
+
+  // Wait for all dispatched compilation tasks to finish before returning from
+  // the function, to make sure we don't get use-after-free errors.
   task_dispatcher_->shutdown();
+
+  RETURN_IF_ERROR(symbol_map.status());
   return std::move(object_loader)
-      .CreateFunctionLibrary(std::move(symbols), symbol_map);
+      .CreateFunctionLibrary(std::move(symbols), *symbol_map);
 }
 
 JitCompiler::TaskDispatcher::TaskDispatcher(TaskRunner task_runner)
@@ -210,21 +236,37 @@ void JitCompiler::TaskDispatcher::dispatch(
   // dispatching the task to avoid deadlock, because `task_runner_` may choose
   // to execute the task in the current thread.
   {
-    absl::MutexLock lock(&mu_);
+    absl::MutexLock lock(mu_);
     ++num_dispatched_tasks_;
   }
 
-  task_runner_([this, task = std::shared_ptr<llvm::orc::Task>(
+  // Wrap the move-only task in a shared struct. This satisfies the thread
+  // pool's requirement for copyable tasks while enabling explicit control of
+  // the task's lifetime.
+  struct TaskHolder {
+    explicit TaskHolder(std::unique_ptr<llvm::orc::Task> task)
+        : task(std::move(task)) {}
+    std::unique_ptr<llvm::orc::Task> task;
+  };
+
+  task_runner_([this, task_holder = std::make_shared<TaskHolder>(
                           std::move(task))]() mutable {
     TraceMe trace("TaskDispatcher::dispatch");
 
-    // We run and explicitly destroy the task before decrementing the counter
-    // and notifying the condition variable, to ensure that the task is fully
-    // executed and cleaned up before task dispatcher shut down.
-    task->run();
-    task.reset();
+    if (task_holder->task) {
+      // We run and explicitly destroy the task before decrementing the counter
+      // and notifying the condition variable to ensure that the task is fully
+      // executed and cleaned up before task dispatcher shut down.
+      task_holder->task->run();
 
-    absl::MutexLock lock(&mu_);
+      // Eagerly destroy the task. The thread pool may retain a copy of this
+      // lambda indefinitely (a "zombie" task). We must ensure the task releases
+      // its resources (e.g. ExecutionSession) immediately, rather than waiting
+      // for the pool to overwrite this slot.
+      task_holder->task.reset();
+    }
+
+    absl::MutexLock lock(mu_);
     --num_dispatched_tasks_;
   });
 }
@@ -233,7 +275,7 @@ void JitCompiler::TaskDispatcher::shutdown() {
   auto all_tasks_finished = [this]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
     return num_dispatched_tasks_ == 0;
   };
-  absl::MutexLock lock(&mu_, absl::Condition(&all_tasks_finished));
+  absl::MutexLock lock(mu_, absl::Condition(&all_tasks_finished));
 }
 
 }  // namespace xla::cpu

@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/ar_crs_combiner.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -28,6 +30,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/status_macros.h"
 #include "xla/hlo/analysis/hlo_replication_analysis.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -42,10 +45,9 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/errors.h"
-#include "tsl/platform/status.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
@@ -57,7 +59,7 @@ namespace {
 // performance.
 absl::StatusOr<bool> ReplaceReplicatedAllReduce(HloModule* module,
                                                 int64_t partition_count) {
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       auto replication_analysis,
       HloReplicationAnalysis::Run(module, /*cross_partition_spmd=*/true));
 
@@ -91,7 +93,7 @@ absl::StatusOr<bool> ReplaceReplicatedAllReduce(HloModule* module,
               HloInstruction::CreateBroadcast(shape, divisor, {}));
           auto div = computation->AddInstruction(HloInstruction::CreateBinary(
               ar->shape(), HloOpcode::kDivide, ar, bcast));
-          TF_RETURN_IF_ERROR(ar->ReplaceAllUsesWith(div));
+          RETURN_IF_ERROR(ar->ReplaceAllUsesWith(div));
           changed = true;
         }
       }
@@ -106,34 +108,51 @@ absl::StatusOr<bool> ReplaceReplicatedAllReduce(HloModule* module,
 // belong to the same group.
 bool HasCombinableReplicaGroup(HloInstruction* hlo, int64_t num_partitions) {
   auto all_reduce = Cast<HloAllReduceInstruction>(hlo);
-  auto replica_groups = all_reduce->replica_groups();
+  const std::vector<ReplicaGroup>& replica_groups =
+      all_reduce->replica_groups();
   const int64_t replica_count = hlo->GetModule()->config().replica_count();
   CHECK(all_reduce->IsCrossModuleAllReduce());
 
-  if (all_reduce->use_global_device_ids()) {
-    if (replica_groups.size() != replica_count) {
-      return false;
-    }
-    for (const auto& group : replica_groups) {
+  const size_t num_replica_groups = replica_groups.size();
+  if (num_replica_groups != replica_count) {
+    return false;
+  }
+  if (all_reduce->use_global_device_ids() && num_replica_groups > 0) {
+    int marker = 0;
+    auto seen_partition_ids = std::make_unique<int[]>(num_partitions);
+    for (const ReplicaGroup& group : replica_groups) {
+      ++marker;
       if (group.replica_ids_size() != num_partitions) {
         return false;
       }
-      absl::flat_hash_set<int64_t> partition_ids;
-      int64_t replica_id = group.replica_ids(0) / num_partitions;
-      for (int64_t i = 0; i < num_partitions; ++i) {
-        if (group.replica_ids(i) / num_partitions != replica_id) {
+      const int64_t group_replica_id0 = group.replica_ids(0);
+      const int64_t group_replica_id_start =
+          (group_replica_id0 / num_partitions) * num_partitions;
+      seen_partition_ids[group_replica_id0 - group_replica_id_start] = marker;
+      for (int64_t i = 1; i < num_partitions; ++i) {
+        const int64_t partition_id =
+            group.replica_ids(i) - group_replica_id_start;
+        if (partition_id < 0 || partition_id >= num_partitions ||
+            seen_partition_ids[partition_id] == marker) {
           return false;
         }
-        partition_ids.insert(group.replica_ids(i) % num_partitions);
+        seen_partition_ids[partition_id] = marker;
       }
-      if (partition_ids.size() != num_partitions) {
-        return false;
+      // If we come here then it is guaranteed that we have seen all replicas
+      // from 0 to num_partitions-1. This is because we mark a partition_id as
+      // seen iff we see a replica id in the range [0, num_partitions) for the
+      // first time. So, there is no need to check that all `seen_partition_ids`
+      // values are equal to `marker`.
+#ifndef NDEBUG
+      for (int64_t i = 0; i < num_partitions; ++i) {
+        CHECK_EQ(seen_partition_ids[i], marker)
+            << "Programming error: seen_partition_ids[" << i
+            << "] != " << marker;
       }
+#endif  // NDEBUG
     }
-    return true;
   }
-
-  return replica_groups.size() == replica_count;
+  return true;
 }
 
 }  // namespace
@@ -178,12 +197,18 @@ std::optional<ArCrsCombiner::ArCrsPair> ArCrsCombiner::MatchesArCrsPattern(
   // belongs to its own group, since the later cross-replica all-reduce combines
   // along the replica dimension.
   if (instruction->IsCrossModuleAllReduce() &&
+      // TODO: b/501070020 - Support async all-reduce.
+      instruction->opcode() != HloOpcode::kAllReduceStart &&
+      instruction->opcode() != HloOpcode::kAllReduceDone &&
       HasCombinableReplicaGroup(instruction, num_spatial_partitions_) &&
       computation_is_addition(instruction->called_computations()[0]) &&
       instruction->user_count() == 1) {
     auto next = instruction->users()[0];
     int64_t distance = 1;
-    while (!next->IsCrossReplicaAllReduce()) {
+    // TODO: b/501070020 - Support async all-reduce.
+    while (!next->IsCrossReplicaAllReduce() &&
+           next->opcode() != HloOpcode::kAllReduceStart &&
+           next->opcode() != HloOpcode::kAllReduceDone) {
       if (can_ar_move_past_instruction(next)) {
         next = next->users()[0];
       } else {
@@ -513,7 +538,7 @@ absl::Status ArCrsCombiner::KeepProvablyEqualInstructionGroupsSPMD(
     HloModule* module) {
   // For SPMD mode, use HloReplicationAnalysis to figure out HLO value
   // equivalence across partitions.
-  TF_ASSIGN_OR_RETURN(
+  ASSIGN_OR_RETURN(
       auto replication_analysis,
       HloReplicationAnalysis::Run(module, /*cross_partition_spmd=*/true));
 
@@ -559,8 +584,8 @@ absl::StatusOr<bool> ArCrsCombiner::RewriteGraph() {
       auto channel_id = all_reduce->channel_id();
       auto prev = all_reduce->mutable_operand(0);
       auto next = all_reduce->users()[0];
-      TF_CHECK_OK(all_reduce->ReplaceUseWith(next, prev));
-      TF_CHECK_OK(parent_computation->RemoveInstruction(all_reduce));
+      CHECK_OK(all_reduce->ReplaceUseWith(next, prev));
+      CHECK_OK(parent_computation->RemoveInstruction(all_reduce));
       while (!next->IsCrossReplicaAllReduce()) {
         switch (next->opcode()) {
           case HloOpcode::kBitcast:
@@ -579,7 +604,7 @@ absl::StatusOr<bool> ArCrsCombiner::RewriteGraph() {
             // other_operand is a cross-module AR, which can be eliminated.
             if (other_operand->IsCrossModuleAllReduce() &&
                 other_operand->user_count() == 1) {
-              TF_CHECK_OK(other_operand->ReplaceAllUsesWith(
+              CHECK_OK(other_operand->ReplaceAllUsesWith(
                   other_operand->mutable_operand(0)));
             } else {
               auto shape = other_operand->shape();
@@ -590,7 +615,7 @@ absl::StatusOr<bool> ArCrsCombiner::RewriteGraph() {
               auto division = parent_computation->AddInstruction(
                   HloInstruction::CreateBinary(shape, HloOpcode::kDivide,
                                                other_operand, divisor));
-              TF_CHECK_OK(other_operand->ReplaceUseWith(next, division));
+              CHECK_OK(other_operand->ReplaceUseWith(next, division));
             }
             break;
           }
@@ -613,7 +638,7 @@ absl::StatusOr<bool> ArCrsCombiner::RewriteGraph() {
   return true;
 }
 
-absl::StatusOr<bool> ArCrsCombiner::Run(
+absl::StatusOr<bool> ArCrsCombiner::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   call_graph_ = CallGraph::Build(module);
@@ -621,16 +646,16 @@ absl::StatusOr<bool> ArCrsCombiner::Run(
   GroupAllReducesById(module);
 
   if (spmd_partition_) {
-    TF_RETURN_IF_ERROR(KeepProvablyEqualInstructionGroupsSPMD(module));
+    RETURN_IF_ERROR(KeepProvablyEqualInstructionGroupsSPMD(module));
   } else {
-    TF_RETURN_IF_ERROR(KeepProvablyEqualInstructionGroupsMPMD());
+    RETURN_IF_ERROR(KeepProvablyEqualInstructionGroupsMPMD());
   }
 
-  TF_ASSIGN_OR_RETURN(auto changed, RewriteGraph());
+  ASSIGN_OR_RETURN(auto changed, RewriteGraph());
 
   if (module->config().replica_count() > 1 && spmd_partition_) {
-    TF_ASSIGN_OR_RETURN(auto replaced, ReplaceReplicatedAllReduce(
-                                           module, num_spatial_partitions_));
+    ASSIGN_OR_RETURN(auto replaced, ReplaceReplicatedAllReduce(
+                                        module, num_spatial_partitions_));
     changed |= replaced;
   }
 

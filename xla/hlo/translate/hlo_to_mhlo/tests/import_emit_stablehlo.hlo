@@ -276,6 +276,36 @@ ENTRY %main.14 (Arg_0.1: f32[8], Arg_1.2: f32[]) -> (f32[8], f32[]) {
 
 // -----
 
+// CHECK-LABEL: module @main attributes {mhlo.cross_program_prefetches = [], mhlo.input_output_alias = [], mhlo.is_dynamic = false, mhlo.num_replicas = 4 : i32, mhlo.use_auto_spmd_partitioning = false, mhlo.xla_entry_computation_parameter_layouts = [dense<[0, 1]> : tensor<2xindex>], mhlo.xla_entry_computation_parameter_tiles = {{\[\[}}]], mhlo.xla_entry_computation_result_layout = [dense<[0, 1]> : tensor<2xindex>], mhlo.xla_entry_computation_result_tiles = {{\[\[}}]]} {
+// CHECK:         sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
+// CHECK:         func.func private @region_add(%[[VAL_0:.*]]: tensor<f32>, %[[VAL_1:.*]]: tensor<f32>) -> tensor<f32> {
+// CHECK:           %[[ADD_0:.*]] = stablehlo.add %[[VAL_0]], %[[VAL_1]] : tensor<f32>
+// CHECK:           return %[[ADD_0]] : tensor<f32>
+// CHECK:         }
+// CHECK:         func.func @main(%[[VAL_2:.*]]: tensor<128x32xf32>) -> tensor<128x32xf32> {
+// CHECK:           %[[VAL_3:.*]] = "stablehlo.all_reduce"(%[[VAL_2]]) <{replica_groups = #stablehlo.replica_group_mesh_axes<mesh = @mesh, axes = [#stablehlo.axis_ref<name = "axis_1">]>}> ({
+// CHECK:           ^bb0(%[[VAL_4:.*]]: tensor<f32>, %[[VAL_5:.*]]: tensor<f32>):
+// CHECK:             %[[ADD_1:.*]] = stablehlo.add %[[VAL_4]], %[[VAL_5]] : tensor<f32>
+// CHECK:             stablehlo.return %[[ADD_1]] : tensor<f32>
+// CHECK:           }) : (tensor<128x32xf32>) -> tensor<128x32xf32>
+// CHECK:           return %[[VAL_3]] : tensor<128x32xf32>
+// CHECK:         }
+// CHECK:       }
+HloModule main, entry_computation_layout={(f32[128,32]{0,1})->f32[128,32]{0,1}}, replica_count=4
+
+%region_add (Arg_0: f32[], Arg_1: f32[]) -> f32[] {
+  %Arg_0 = f32[] parameter(0)
+  %Arg_1 = f32[] parameter(1)
+  ROOT %add = f32[] add(%Arg_0, %Arg_1)
+}
+
+ENTRY %main.mesh_axes (Arg_0.1: f32[128,32]) -> f32[128,32] {
+  %Arg_0.1 = f32[128,32] parameter(0)
+  ROOT %all-reduce.mesh = f32[128,32] all-reduce(%Arg_0.1), replica_groups=mesh['axis_0'=2,'axis_1'=2] {'axis_1'}, to_apply=%region_add
+}
+
+// -----
+
 // CHECK-LABEL: module @main attributes {mhlo.cross_program_prefetches = [], mhlo.input_output_alias = [], mhlo.is_dynamic = false, mhlo.use_auto_spmd_partitioning = false} {
 // CHECK:         func.func private @region_0.2(%[[VAL_0:.*]]: tensor<f32>, %[[VAL_1:.*]]: tensor<f32>) -> tensor<f32> {
 // CHECK:           %[[VAL_2:.*]] = stablehlo.maximum %[[VAL_0]], %[[VAL_1]] : tensor<f32>
@@ -1104,23 +1134,6 @@ ENTRY %main.4 (Arg_0.1: s8[2,2,2], Arg_1.2: s8[2,2,3]) -> s32[2,2,3] {
   %Arg_0.1 = s8[2,2,2] parameter(0)
   %Arg_1.2 = s8[2,2,3] parameter(1)
   ROOT %dot.3 = s32[2,2,3] dot(%Arg_0.1, %Arg_1.2), lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
-}
-
-// -----
-
-// CHECK-LABEL: module @main attributes {mhlo.cross_program_prefetches = [], mhlo.input_output_alias = [], mhlo.is_dynamic = false, mhlo.use_auto_spmd_partitioning = false} {
-// CHECK:         func.func @main(%[[VAL_0:.*]]: tensor<10x16xbf16>, %[[VAL_1:.*]]: tensor<32x20xbf16>, %[[VAL_2:.*]]: tensor<10x2xui16>) -> tensor<10x20xf32> {
-// CHECK:           %[[VAL_3:.*]] = "mhlo.sparse_dot"(%[[VAL_0]], %[[VAL_1]], %[[VAL_2]]) <{dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>, lhs_sparsity = #mhlo.sparsity<dimension = 1, n = 2, m = 4>, precision_config = [#mhlo<precision DEFAULT>, #mhlo<precision DEFAULT>]}> : (tensor<10x16xbf16>, tensor<32x20xbf16>, tensor<10x2xui16>) -> tensor<10x20xf32>
-// CHECK:           return %[[VAL_3]] : tensor<10x20xf32>
-// CHECK:         }
-// CHECK:       }
-HloModule main, entry_computation_layout={(bf16[10,16]{1,0}, bf16[32,20]{1,0}, u16[10,2]{1,0})->f32[10,20]{1,0}}
-
-ENTRY %main.5 (Arg_0.1: bf16[10,16], Arg_1.2: bf16[32,20], Arg_2.3: u16[10,2]) -> f32[10,20] {
-  %Arg_0.1 = bf16[10,16] parameter(0)
-  %Arg_1.2 = bf16[32,20] parameter(1)
-  %Arg_2.3 = u16[10,2] parameter(2)
-  ROOT %dot.4 = f32[10,20] dot(%Arg_0.1, %Arg_1.2, %Arg_2.3), lhs_contracting_dims={1}, rhs_contracting_dims={0}, sparsity=L.1@2:4
 }
 
 // -----
@@ -2259,7 +2272,7 @@ ENTRY %main.3 (Arg_0.1: f32[3,4]) -> f32[3,4,1] {
 
 // CHECK-LABEL: module @main attributes {mhlo.cross_program_prefetches = [], mhlo.input_output_alias = [], mhlo.is_dynamic = false, mhlo.use_auto_spmd_partitioning = false} {
 // CHECK:         func.func @main(%[[VAL_0:.*]]: tensor<4x4xf32>, %[[VAL_1:.*]]: tensor<3x4xf32>) -> tuple<tensor<4x4xf32>, tensor<3x4xf32>> {
-// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.optimization_barrier %[[VAL_0]], %[[VAL_1]] : tensor<4x4xf32>, tensor<3x4xf32>
+// CHECK:           %[[VAL_2:.*]]:2 = stablehlo.optimization_barrier {mhlo.sharding = "{{\{\{}}replicated}, {devices=[1,2]<=[2]}}"} %[[VAL_0]], %[[VAL_1]] : tensor<4x4xf32>, tensor<3x4xf32>
 // CHECK:           %[[VAL_3:.*]] = stablehlo.tuple %[[VAL_2]]#0, %[[VAL_2]]#1 {xla_shape = "(f32[4,4]{1,0}, f32[3,4]{1,0})"} : tuple<tensor<4x4xf32>, tensor<3x4xf32>>
 // CHECK:           return %[[VAL_3]] : tuple<tensor<4x4xf32>, tensor<3x4xf32>>
 // CHECK:         }

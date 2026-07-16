@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,9 +23,15 @@ limitations under the License.
 
 #include "absl/base/casts.h"
 #include "absl/hash/hash.h"
+#include "absl/log/check.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "include/dlpack/dlpack.h"
 #include "xla/tsl/platform/status_macros.h"
+#include "mlir/Support/LLVM.h"
 #include "nanobind/nanobind.h"
 #include "nanobind/ndarray.h"
 #include "nanobind/stl/optional.h"  // IWYU pragma: keep
@@ -33,28 +39,34 @@ limitations under the License.
 #include "nanobind/stl/string.h"  // IWYU pragma: keep
 #include "nanobind/stl/string_view.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
+#include "xla/array.h"
 #include "xla/debug_options_flags.h"
 #include "xla/hlo/builder/xla_computation.h"
+#include "xla/hlo/ir/backend_config.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/ir/hlo_schedule.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/parser/hlo_parser.h"
+#include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/literal.h"
 #include "xla/pjrt/exceptions.h"
 #include "xla/pjrt/status_casters.h"
 #include "xla/python/dlpack_types.h"
 #include "xla/python/nb_absl_span.h"
+#include "xla/python/nb_numpy.h"
 #include "xla/python/types.h"
 #include "xla/service/hlo_graph_dumper.h"
+#include "xla/service/hlo_module_config.h"
 #include "xla/service/spmd/shardy/stablehlo_round_trip/stablehlo_import.h"
+#include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
-#include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/python/lib/core/numpy.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -107,7 +119,9 @@ absl::StatusOr<nb::bytes> GetHloModuleSerializedProto(const HloModule& module) {
 absl::StatusOr<std::shared_ptr<HloModule>> HloModuleFromSerializedProto(
     const nb::bytes& bytes) {
   HloModuleProto proto;
-  proto.ParseFromArray(bytes.c_str(), bytes.size());
+  if (!proto.ParseFromString(absl::string_view(bytes.c_str(), bytes.size()))) {
+    return InvalidArgument("Failed to deserialize HloModuleProto");
+  }
   ASSIGN_OR_RETURN(const HloModuleConfig module_config,
                    HloModule::CreateModuleConfigFromProto(
                        proto, GetDebugOptionsFromFlags()));
@@ -360,6 +374,8 @@ NB_MODULE(_hlo, m) {
       .value("U64", U64)
       .value("F16", F16)
       .value("F4E2M1FN", F4E2M1FN)
+      .value("F6E2M3FN", F6E2M3FN)
+      .value("F6E3M2FN", F6E3M2FN)
       .value("F8E3M4", F8E3M4)
       .value("F8E4M3", F8E4M3)
       .value("F8E4M3FN", F8E4M3FN)
@@ -448,7 +464,8 @@ NB_MODULE(_hlo, m) {
       .def("__setstate__", [](Layout* self, nb::tuple t) {
         LayoutProto result;
         nb::bytes serialized = nb::cast<nb::bytes>(t[0]);
-        result.ParseFromArray(serialized.c_str(), serialized.size());
+        result.ParseFromString(
+            absl::string_view(serialized.c_str(), serialized.size()));
         new (self) Layout(ValueOrThrow(Layout::FromProto(result)));
       });
 
@@ -642,8 +659,9 @@ NB_MODULE(_hlo, m) {
            [](XlaComputation* self,
               const nb::bytes& serialized_hlo_module_proto) {
              HloModuleProto proto;
-             proto.ParseFromArray(serialized_hlo_module_proto.c_str(),
-                                  serialized_hlo_module_proto.size());
+             proto.ParseFromString(
+                 absl::string_view(serialized_hlo_module_proto.c_str(),
+                                   serialized_hlo_module_proto.size()));
              new (self) XlaComputation(proto);
            })
       .def("get_hlo_module", xla::ValueOrThrowWrapper(GetHloModule))
@@ -758,6 +776,27 @@ NB_MODULE(_hlo, m) {
       }
       return std::make_shared<InstructionWrapper>(root, module_);
     }
+    std::optional<std::string> get_frontend_attribute(
+        absl::string_view key) const {
+      return inst_->get_frontend_attribute(key);
+    }
+    void set_frontend_attribute(std::string key, std::string value) {
+      xla::FrontendAttributes proto = inst_->frontend_attributes();
+      (*proto.mutable_map())[std::move(key)] = std::move(value);
+      const_cast<HloInstruction*>(inst_)->set_frontend_attributes(
+          std::move(proto));
+    }
+    void set_core_assignment(std::vector<int64_t> core_ids) {
+      xla::ThrowIfError(
+          xla::SetCoreAssignment(const_cast<HloInstruction*>(inst_), core_ids));
+    }
+    std::vector<int64_t> core_assignment() const {
+      auto cores = xla::GetCoreAssignment(inst_);
+      if (!cores.ok()) {
+        return {};
+      }
+      return *cores;
+    }
     Py_hash_t hash() const { return AbslHashToPythonHash(absl::HashOf(inst_)); }
     bool operator==(const InstructionWrapper& other) const {
       return inst_ == other.inst_;
@@ -775,6 +814,14 @@ NB_MODULE(_hlo, m) {
       .def("users", &InstructionWrapper::users)
       .def("operands", &InstructionWrapper::operands)
       .def("async_wrapped_root", &InstructionWrapper::async_wrapped_root)
+      .def("get_frontend_attribute",
+           &InstructionWrapper::get_frontend_attribute, nb::arg("key"))
+      .def("set_frontend_attribute",
+           &InstructionWrapper::set_frontend_attribute, nb::arg("key"),
+           nb::arg("value"))
+      .def("set_core_assignment", &InstructionWrapper::set_core_assignment,
+           nb::arg("core_ids"))
+      .def("core_assignment", &InstructionWrapper::core_assignment)
       .def("__hash__", &InstructionWrapper::hash)
       .def("__eq__", &InstructionWrapper::operator==);
 
@@ -834,6 +881,25 @@ NB_MODULE(_hlo, m) {
             const_cast<HloComputation*>(c.comp())->ReplaceInstruction(
                 const_cast<HloInstruction*>(old_inst->inst()),
                 const_cast<HloInstruction*>(new_inst->inst())));
+      });
+
+  hlo_computation_class.def(
+      "create_unary_instruction",
+      [](ComputationWrapper& c, xla::HloOpcode opcode,
+         std::shared_ptr<InstructionWrapper> operand) {
+        if (operand == nullptr) {
+          throw XlaRuntimeError(
+              "create_unary_instruction operand cannot be None.");
+        }
+        // TODO(phawkins): Do not assume the output shape of a unary instruction
+        // always matches its operand's shape (e.g., for kIsFinite it returns
+        // PRED). Allow users to specify the output shape.
+        HloInstruction* new_inst =
+            const_cast<HloComputation*>(c.comp())->AddInstruction(
+                HloInstruction::CreateUnary(
+                    operand->inst()->shape(), opcode,
+                    const_cast<HloInstruction*>(operand->inst())));
+        return std::make_shared<InstructionWrapper>(new_inst, c.module());
       });
 
   class ScheduleWrapper {
@@ -979,7 +1045,8 @@ NB_MODULE(_hlo, m) {
            [](OpSharding* self, nb::tuple t) {
              new (self) OpSharding();
              nb::bytes serialized = nb::cast<nb::bytes>(t[0]);
-             self->ParseFromArray(serialized.c_str(), serialized.size());
+             self->ParseFromString(
+                 absl::string_view(serialized.c_str(), serialized.size()));
            })
       .def_prop_rw("type", &xla::OpSharding::type, &xla::OpSharding::set_type)
       .def_prop_rw("replicate_on_last_tile_dim",
@@ -995,7 +1062,7 @@ NB_MODULE(_hlo, m) {
            [](const xla::OpSharding& self) { return self.DebugString(); })
       .def("ParseFromString",
            [](OpSharding& sharding, const nb::bytes& s) {
-             sharding.ParseFromArray(s.c_str(), s.size());
+             sharding.ParseFromString(absl::string_view(s.c_str(), s.size()));
            })
       .def("SerializeToString",
            [](const OpSharding& sharding) {
@@ -1119,12 +1186,16 @@ NB_MODULE(_hlo, m) {
       .def("__repr__",
            [](const xla::HloSharding& self) { return self.ToString(); })
       .def("to_proto", &xla::HloSharding::ToProto)
-      .def("get_axis_sizes", [](const xla::HloSharding& self) {
-        // If returning the SmallVector, we encounter the error "unable to
-        // convert function return value to a Python type!".
-        mlir::SmallVector<int64_t> mesh_shape =
-            xla::sdy::getAxisSizes(self.tile_assignment());
-        return std::vector<int64_t>(mesh_shape.begin(), mesh_shape.end());
+      .def("get_axis_sizes",
+           [](const xla::HloSharding& self) {
+             // If returning the SmallVector, we encounter the error "unable to
+             // convert function return value to a Python type!".
+             mlir::SmallVector<int64_t> mesh_shape =
+                 xla::sdy::getAxisSizes(self.tile_assignment());
+             return std::vector<int64_t>(mesh_shape.begin(), mesh_shape.end());
+           })
+      .def("v3_to_v2_sharding", [](const xla::HloSharding& self) {
+        return xla::HloSharding::V3ToV2Sharding(self);
       });
 
   m.def("hlo_module_to_dot_graph",

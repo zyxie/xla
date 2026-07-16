@@ -54,8 +54,7 @@ TEST_F(TiledHloInstructionTest, TileSizesAndStridesShouldMatchHloShapeRank) {
       ShapeUtil::MakeShape(PrimitiveType::F32, {32, 64}), "p0");
 
   IndexingMap tile_offsets_indexing = IndexingMap::FromTensorSizes(
-      ParseSymbolicMap("(d0) -> (d0 floordiv 16, (d0 mod 16) * 16)",
-                       &mlir_context_),
+      ParseSymbolicMap("(d0) -> (d0 / 16, (d0 mod 16) * 16)", &mlir_context_),
       /*dim_upper_bounds=*/{8},
       /*symbol_upper_bounds=*/{});
 
@@ -195,8 +194,9 @@ TEST_F(TiledHloInstructionTest, ToString) {
       /*range_vars=*/{},
       /*rt_vars=*/{IndexingMap::Variable{0, 3}});
 
-  TiledHloRegion region;
-  region.push_back(std::move(tiled_p2));
+  std::vector<std::unique_ptr<TiledHloInstruction>> instructions;
+  instructions.push_back(std::move(tiled_p2));
+  TiledHloRegion region(std::move(instructions));
   llvm::SmallVector<TiledHloRegion> regions;
   regions.push_back(std::move(region));
   std::unique_ptr<HloInstruction> p3_hlo = HloInstruction::CreateParameter(

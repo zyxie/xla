@@ -137,7 +137,7 @@ absl::Status AnnotateKernelLaunchDimensions(
     kernel->addFnAttr("nvvm.reqntid", attr);
     // Maybe we want to set "reqnctapercluster" here, but not sure if needed or
     // if LLVM supports that yet. Let's do that later when needed.
-  } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
+  } else if (target_triple.getArch() == llvm::Triple::amdgpu) {
     kernel->addFnAttr("amdgpu-flat-work-group-size",
                       absl::StrJoin({launch_dims.num_threads_per_block(),
                                      launch_dims.num_threads_per_block()},
@@ -217,12 +217,11 @@ absl::StatusOr<llvm::Function*> BuildKernelPrototype(
 }
 
 absl::StatusOr<llvm::Function*> RemoveUnusedTritonAbiArguments(
-    llvm::Module* llvm_module, IrEmitterContext& ir_emitter_context,
-    const std::string& sanitized_kernel_name, bool keep_scratch) {
+    llvm::Module* llvm_module, const std::string& sanitized_kernel_name,
+    const std::string& sanitized_kernel_impl_name, bool keep_scratch) {
   llvm::Function* impl_fn = llvm_module->getFunction(sanitized_kernel_name);
   TF_RET_CHECK(impl_fn);
-  impl_fn->setName(ir_emitter_context.GetSanitizedUniqueName(
-      sanitized_kernel_name + "_impl"));
+  impl_fn->setName(sanitized_kernel_impl_name);
 
   constexpr int arg_to_remove = 2;
 

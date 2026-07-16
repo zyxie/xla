@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/layout.h"
 #include "xla/literal.h"
+#include "xla/service/hlo.pb.h"
 #include "xla/service/pattern_matcher.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
@@ -208,6 +209,15 @@ bool IsEffectiveParameter(const HloInstruction& instr) {
          ((instr.opcode() == HloOpcode::kBitcast ||
            instr.opcode() == HloOpcode::kGetTupleElement) &&
           IsEffectiveParameter(*instr.operand(0)));
+}
+
+const HloInstruction* StripCastLike(const HloInstruction* instr) {
+  while (instr->opcode() == HloOpcode::kCopy ||
+         instr->opcode() == HloOpcode::kConvert ||
+         instr->opcode() == HloOpcode::kBitcast) {
+    instr = instr->operand(0);
+  }
+  return instr;
 }
 
 HloInstruction* GetFirstInstructionWithOpcode(const HloComputation& computation,

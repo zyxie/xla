@@ -196,24 +196,6 @@ TEST_F(SyclGpuRuntimeTest, TestStreamPoolDestroy_Negative) {
   EXPECT_EQ(stream_handle, nullptr);
 }
 
-TEST_F(SyclGpuRuntimeTest, TestMaxStreamsPerDevice) {
-  // Ensure that the maximum number of streams per device is respected.
-  constexpr int kMaxStreams = kMaxStreamsPerDevice;
-  std::vector<StreamPtr> streams(kMaxStreams);
-  for (int i = 0; i < kMaxStreams - 1; ++i) {
-    TF_ASSERT_OK_AND_ASSIGN(streams[i], SyclStreamPool::GetOrCreateStream(
-                                            kDefaultDeviceOrdinal,
-                                            /*enable_multiple_streams=*/true));
-    ASSERT_NE(streams[i], nullptr);
-  }
-
-  // Attempt to create one more stream, which should fail.
-  EXPECT_THAT(
-      SyclStreamPool::GetOrCreateStream(kDefaultDeviceOrdinal,
-                                        /*enable_multiple_streams=*/true),
-      absl_testing::StatusIs(absl::StatusCode::kResourceExhausted));
-}
-
 TEST_F(SyclGpuRuntimeTest, TestGetTimerProperties) {
   TF_ASSERT_OK_AND_ASSIGN(SyclTimerProperties timer_props,
                           SyclGetTimerProperties(kDefaultDeviceOrdinal));
@@ -236,16 +218,13 @@ TEST_F(SyclGpuRuntimeTest, TestSyclGetRecentEventFromStream) {
 
   TF_ASSERT_OK(SyclStreamSynchronize(stream_handle.get()));
 
-  TF_ASSERT_OK_AND_ASSIGN(std::optional<::sycl::event> event,
-                          SyclGetRecentEventFromStream(stream_handle.get()));
-
-  ASSERT_TRUE(event.has_value());
+  ASSERT_OK_AND_ASSIGN(::sycl::event event,
+                       SyclGetRecentEventFromStream(stream_handle.get()));
 
   // Expect the event to be in a valid state. The command_execution_status
   // should not be "unknown".
-  EXPECT_NE(
-      event.value().get_info<::sycl::info::event::command_execution_status>(),
-      ::sycl::info::event_command_status::ext_oneapi_unknown);
+  EXPECT_NE(event.get_info<::sycl::info::event::command_execution_status>(),
+            ::sycl::info::event_command_status::ext_oneapi_unknown);
 
   FreeAndNullify(device_buf);
 }

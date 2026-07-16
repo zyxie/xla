@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -74,12 +73,23 @@ using ::testing::Pointwise;
 using ::testing::Property;
 using ::testing::StrEq;
 using ::testing::UnorderedElementsAre;
+using ::tsl::proto_testing::EqualsProto;
 
 // Adapts the internal equals proto to work with PointWise
 MATCHER(EqualsProto, "") {
   const auto& a = ::testing::get<0>(arg);
   const auto& b = ::testing::get<1>(arg);
   return ::testing::Matches(tsl::proto_testing::EqualsProto(b))(a);
+}
+
+OriginalValueRecoveryTableProto ClearRecoveryModuleIds(
+    OriginalValueRecoveryTableProto proto) {
+  for (auto& entry : *proto.mutable_entries()) {
+    if (entry.has_recovery_module()) {
+      entry.mutable_recovery_module()->clear_id();
+    }
+  }
+  return proto;
 }
 
 TEST(HloModuleTest, AbslHashValue) {
@@ -1355,6 +1365,177 @@ ENTRY entry_comp {
   EXPECT_THAT(string_before, StrEq(string_after));
 }
 
+TEST(HloModuleTest, OriginalValueRecoveryTableProtoRoundTrip) {
+  const char* const hlo_string =
+      R"(HloModule module, entry_computation_layout={()->s32[1,3]{1,0}}, num_partitions=2, origin_recovery_table={
+  {"constant"} : {"constant__ovp0"},
+  "
+    HloModule recovery_module, entry_computation_layout={(s32[2,3]{1,0})->s32[2,3]{1,0}}
+
+    %add (x: s32[], y: s32[]) -> s32[] {
+      %x = s32[] parameter(0)
+      %y = s32[] parameter(1)
+      ROOT %add = s32[] add(%x, %y)
+    }
+
+    %add.clone (x.1: s32[], y.1: s32[]) -> s32[] {
+      %x.1 = s32[] parameter(0)
+      %y.1 = s32[] parameter(1)
+      ROOT %add.1 = s32[] add(%x.1, %y.1)
+    }
+
+    ENTRY %recovery_computation (param: s32[2,3]) -> s32[2,3] {
+      %partition-id = u32[] partition-id()
+      %constant = u32[] constant(0)
+      %compare = pred[] compare(%partition-id, %constant), direction=EQ
+      %broadcast = pred[2,3]{1,0} broadcast(%compare), dimensions={}
+      %param = s32[2,3]{1,0} parameter(0), sharding={maximal device=0}
+      %constant.1 = s32[] constant(0)
+      %broadcast.1 = s32[2,3]{1,0} broadcast(%constant.1), dimensions={}
+      %select = s32[2,3]{1,0} select(%broadcast, %param, %broadcast.1)
+      ROOT %all-reduce = s32[2,3]{1,0} all-reduce(%select), channel_id=1, replica_groups={{0,1}}, use_global_device_ids=true, to_apply=%add.clone, sharding={replicated}
+    }
+  "
+}
+
+%add.clone (x.1: s32[], y.1: s32[]) -> s32[] {
+  %x.1 = s32[] parameter(0)
+  %y.1 = s32[] parameter(1)
+  ROOT %add.1 = s32[] add(s32[] %x.1, s32[] %y.1)
+}
+
+ENTRY %entry_spmd () -> s32[1,3] {
+  %partition-id = u32[] partition-id()
+  %constant.2 = u32[] constant(0)
+  %compare = pred[] compare(u32[] %partition-id, u32[] %constant.2), direction=EQ
+  %broadcast = pred[2,3]{1,0} broadcast(pred[] %compare), dimensions={}
+  %constant.1 = s32[2,3]{1,0} constant({ { 1, 1, 1 }, { 1, 1, 1 } }), origin={{"constant__ovp0"}}
+  %constant.3 = s32[] constant(0)
+  %broadcast.1 = s32[2,3]{1,0} broadcast(s32[] %constant.3), dimensions={}
+  %select = s32[2,3]{1,0} select(pred[2,3]{1,0} %broadcast, s32[2,3]{1,0} %constant.1, s32[2,3]{1,0} %broadcast.1)
+  %all-reduce = s32[2,3]{1,0} all-reduce(s32[2,3]{1,0} %select), channel_id=1, replica_groups={{0,1}}, use_global_device_ids=true, to_apply=%add.clone
+  %constant.4 = s32[2]{0} constant({1, 0})
+  %dynamic-slice = s32[1]{0} dynamic-slice(s32[2]{0} %constant.4, u32[] %partition-id), dynamic_slice_sizes={1}
+  %reshape = s32[] reshape(s32[1]{0} %dynamic-slice)
+  %dynamic-slice.1 = s32[1,3]{1,0} dynamic-slice(s32[2,3]{1,0} %all-reduce, s32[] %reshape, s32[] %constant.3), dynamic_slice_sizes={1,3}
+  ROOT %copy.1 = s32[1,3]{1,0} copy(s32[1,3]{1,0} %dynamic-slice.1)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnUnverifiedModule(hlo_string));
+  HloModuleProto module_proto = module->ToProto();
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module_from_proto,
+      HloModule::CreateFromProto(module_proto, module->config()));
+  EXPECT_THAT(ClearRecoveryModuleIds(
+                  module_from_proto->original_value_recovery_table().ToProto()),
+              EqualsProto(ClearRecoveryModuleIds(
+                  module->original_value_recovery_table().ToProto())));
+}
+
+TEST(HloModuleTest, DebugAttributesProtoRoundTrip) {
+  const char* const hlo_string =
+      R"(HloModule module, entry_computation_layout={()->s32[2,3]{1,0}},
+debug_attributes={
+  {"constant"}:({log_mode=default,callback_id=123,partitioned=true}),
+  {"constant.1"}:({log_mode=fusion_debugger,callback_id=456,partitioned=false})
+}
+
+
+ENTRY %entry_comp () -> s32[2,3] {
+  %c = s32[2,3]{1,0} constant({ { 1, 1, 1 }, { 1, 1, 1 } }), origin={{"constant"}}
+  ROOT %c1 = s32[2,3]{1,0} copy(%c), origin={{"constant.1"}}
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnUnverifiedModule(hlo_string));
+  HloModuleProto module_proto = module->ToProto();
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module_from_proto,
+      HloModule::CreateFromProto(module_proto, module->config()));
+  EXPECT_THAT(module_from_proto->ToProto().debug_attributes(),
+              Pointwise(EqualsProto(), module->ToProto().debug_attributes()));
+}
+
+TEST(HloModuleTest,
+     OriginalValueRecoveryTableAndDebugAttributesProtoRoundTrip) {
+  const char* const hlo_string =
+      R"(HloModule module, entry_computation_layout={()->s32[1,3]{1,0}}, num_partitions=2,
+origin_recovery_table={
+  {"constant"} : {"constant__ovp0"},
+  "
+    HloModule recovery_module, entry_computation_layout={(s32[2,3]{1,0})->s32[2,3]{1,0}}
+
+    %add (x: s32[], y: s32[]) -> s32[] {
+      %x = s32[] parameter(0)
+      %y = s32[] parameter(1)
+      ROOT %add = s32[] add(%x, %y)
+    }
+
+    %add.clone (x.1: s32[], y.1: s32[]) -> s32[] {
+      %x.1 = s32[] parameter(0)
+      %y.1 = s32[] parameter(1)
+      ROOT %add.1 = s32[] add(%x.1, %y.1)
+    }
+
+    ENTRY %recovery_computation (param: s32[2,3]) -> s32[2,3] {
+      %partition-id = u32[] partition-id()
+      %constant = u32[] constant(0)
+      %compare = pred[] compare(%partition-id, %constant), direction=EQ
+      %broadcast = pred[2,3]{1,0} broadcast(%compare), dimensions={}
+      %param = s32[2,3]{1,0} parameter(0), sharding={maximal device=0}
+      %constant.1 = s32[] constant(0)
+      %broadcast.1 = s32[2,3]{1,0} broadcast(%constant.1), dimensions={}
+      %select = s32[2,3]{1,0} select(%broadcast, %param, %broadcast.1)
+      ROOT %all-reduce = s32[2,3]{1,0} all-reduce(%select), channel_id=1, replica_groups={{0,1}}, use_global_device_ids=true, to_apply=%add.clone, sharding={replicated}
+    }
+  "
+},
+debug_attributes={
+  {"constant"}:({log_mode=default,callback_id=123,partitioned=true}),
+  {"constant.1"}:({log_mode=fusion_debugger,callback_id=456,partitioned=false})
+}
+
+%add.clone (x.1: s32[], y.1: s32[]) -> s32[] {
+  %x.1 = s32[] parameter(0)
+  %y.1 = s32[] parameter(1)
+  ROOT %add.1 = s32[] add(s32[] %x.1, s32[] %y.1)
+}
+
+ENTRY %entry_spmd () -> s32[1,3] {
+  %partition-id = u32[] partition-id()
+  %constant.2 = u32[] constant(0)
+  %compare = pred[] compare(u32[] %partition-id, u32[] %constant.2), direction=EQ
+  %broadcast = pred[2,3]{1,0} broadcast(pred[] %compare), dimensions={}
+  %constant.1 = s32[2,3]{1,0} constant({ { 1, 1, 1 }, { 1, 1, 1 } }), origin={{"constant__ovp0"}}
+  %constant.3 = s32[] constant(0)
+  %broadcast.1 = s32[2,3]{1,0} broadcast(s32[] %constant.3), dimensions={}
+  %select = s32[2,3]{1,0} select(pred[2,3]{1,0} %broadcast, s32[2,3]{1,0} %constant.1, s32[2,3]{1,0} %broadcast.1)
+  %all-reduce = s32[2,3]{1,0} all-reduce(s32[2,3]{1,0} %select), channel_id=1, replica_groups={{0,1}}, use_global_device_ids=true, to_apply=%add.clone
+  %constant.4 = s32[2]{0} constant({1, 0})
+  %dynamic-slice = s32[1]{0} dynamic-slice(s32[2]{0} %constant.4, u32[] %partition-id), dynamic_slice_sizes={1}
+  %reshape = s32[] reshape(s32[1]{0} %dynamic-slice)
+  %dynamic-slice.1 = s32[1,3]{1,0} dynamic-slice(s32[2,3]{1,0} %all-reduce, s32[] %reshape, s32[] %constant.3), dynamic_slice_sizes={1,3}
+  ROOT %copy.1 = s32[1,3]{1,0} copy(s32[1,3]{1,0} %dynamic-slice.1)
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnUnverifiedModule(hlo_string));
+  HloModuleProto module_proto = module->ToProto();
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> module_from_proto,
+      HloModule::CreateFromProto(module_proto, module->config()));
+  EXPECT_THAT(ClearRecoveryModuleIds(
+                  module_from_proto->original_value_recovery_table().ToProto()),
+              EqualsProto(ClearRecoveryModuleIds(
+                  module->original_value_recovery_table().ToProto())));
+  EXPECT_THAT(module_from_proto->ToProto().debug_attributes(),
+              Pointwise(EqualsProto(), module->ToProto().debug_attributes()));
+}
+
 TEST(HloModuleTest, TestCreateFromProtoUpdatesBufferAssignment) {
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
                           ParseAndReturnUnverifiedModule(R"(
@@ -1541,6 +1722,12 @@ TEST(HloModuleTest, OnTheFlyCanonicalizeStackFrameId) {
       module->entry_computation()->GetInstructionWithName("inst2");
   EXPECT_EQ(i1->metadata().stack_frame_id(), 1);
   EXPECT_EQ(i2->metadata().stack_frame_id(), 1);
+
+  // Make sure we didn't accidentally populate an instruction with no
+  // metadata with empty metadata instead.
+  HloInstruction* r =
+      module->entry_computation()->GetInstructionWithName("root");
+  ASSERT_FALSE(r->has_metadata());
 }
 
 TEST(HloModuleTest, DeviceTypeSerialization) {
@@ -1778,10 +1965,10 @@ TEST(HloModuleTest, BackendConfigDeduplicationAndRoundtrip) {
   // Verify in-memory deduplication is active.
   EXPECT_EQ(&p0->raw_backend_config_string(), &p1->raw_backend_config_string());
 
-  HloModuleProto proto = m->ToProto(/*intern_backend_config=*/true);
+  HloModuleProto proto =
+      m->ToProto(HloProtoOptions{/*deduplicate_backend_config=*/true});
 
   // Verify the serialized proto structure partially using proto matchers.
-  using ::tsl::proto_testing::EqualsProto;
   using ::tsl::proto_testing::Partially;
   EXPECT_THAT(proto, Partially(EqualsProto(R"pb(
                 payloads: "tokamax:{\"data\": 1}"
@@ -1825,7 +2012,7 @@ TEST(HloModuleTest, BackendConfigNoInternByDefault) {
 
   HloModuleProto proto = m->ToProto();
   // Config is NOT interned in payloads.
-  EXPECT_EQ(proto.payloads_size(), 0);
+  ASSERT_EQ(proto.payloads_size(), 0);
 
   using ::tsl::proto_testing::EqualsProto;
   using ::tsl::proto_testing::Partially;
@@ -1860,7 +2047,7 @@ TEST(HloModuleTest, BackendConfigDeduplicationWithBaseOffset) {
   proto.add_payloads("pre_existing_metadata");
 
   // 2. Serialize to this pre-filled proto with interning!
-  m->ToProto(&proto, /*intern_backend_config=*/true);
+  m->ToProto(&proto, HloProtoOptions{/*deduplicate_backend_config=*/true});
 
   // Verify shifted ID and combined payloads.
   using ::tsl::proto_testing::EqualsProto;
@@ -1875,6 +2062,307 @@ TEST(HloModuleTest, BackendConfigDeduplicationWithBaseOffset) {
                   }
                 }
               )pb")));
+}
+
+TEST(HloModuleTest, MetadataValueSerializesAsPayloadId) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("abc");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto = m.ToProto(HloProtoOptions());
+
+  // Expect that the serialized payloads contains "abc"
+  ASSERT_EQ(proto.payloads_size(), 1);
+  EXPECT_EQ(proto.payloads(0), "abc");
+
+  // Expect the instruction to use the ID instead of the value
+  const HloInstructionProto& inst_proto = proto.computations(0).instructions(0);
+  EXPECT_THAT(inst_proto.metadata(), EqualsProto(R"pb(
+                metadata_payload { id: 0 }
+              )pb"));
+}
+
+TEST(HloModuleTest, RepeatedMetadataPayloadValuesDedupInStorage) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* p0 =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "p0"));
+  HloInstruction* p1 =
+      builder.AddInstruction(HloInstruction::CreateParameter(1, shape, "p1"));
+
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("abc");
+  p0->set_metadata(metadata);
+  p1->set_metadata(metadata);
+
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto = m.ToProto(HloProtoOptions());
+
+  // Only 1 payload entry should exist (deduplicated!)
+  ASSERT_EQ(proto.payloads_size(), 1);
+  EXPECT_EQ(proto.payloads(0), "abc");
+
+  // Both instructions point to ID 0
+  const HloInstructionProto& inst0_proto =
+      proto.computations(0).instructions(0);
+  const HloInstructionProto& inst1_proto =
+      proto.computations(0).instructions(1);
+  EXPECT_THAT(inst0_proto.metadata(), EqualsProto(R"pb(
+                metadata_payload { id: 0 }
+              )pb"));
+  EXPECT_THAT(inst1_proto.metadata(), EqualsProto(R"pb(
+                metadata_payload { id: 0 }
+              )pb"));
+}
+
+TEST(HloModuleTest, CreateFromProtoInlinesMetadataPayloadIds) {
+  HloModuleProto proto;
+  proto.set_name("test_module");
+  proto.set_entry_computation_id(1);
+  ProgramShapeProto program_shape;
+  *program_shape.mutable_result() = ShapeUtil::MakeShape(F32, {}).ToProto();
+  *proto.mutable_host_program_shape() = program_shape;
+  proto.add_payloads("abc");
+
+  HloComputationProto* comp_proto = proto.add_computations();
+  comp_proto->set_id(1);
+  comp_proto->set_name("comp");
+  comp_proto->set_root_id(0);
+
+  HloInstructionProto* inst_proto = comp_proto->add_instructions();
+  inst_proto->set_id(0);
+  inst_proto->set_name("inst");
+  inst_proto->set_opcode("parameter");
+  *inst_proto->mutable_shape() = ShapeUtil::MakeShape(F32, {}).ToProto();
+  inst_proto->mutable_metadata()->mutable_metadata_payload()->set_id(0);
+
+  TF_ASSERT_OK_AND_ASSIGN(HloModuleConfig config,
+                          HloModule::CreateModuleConfigFromProto(
+                              proto, GetDebugOptionsFromFlags()));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> loaded,
+                          HloModule::CreateFromProto(proto, config));
+
+  const HloInstruction* loaded_inst =
+      loaded->entry_computation()->root_instruction();
+
+  // In-memory instruction must have the value inlined and no ID!
+  EXPECT_TRUE(loaded_inst->has_metadata_payload());
+  EXPECT_EQ(loaded_inst->metadata_payload_string(), "abc");
+  EXPECT_EQ(loaded_inst->metadata().metadata_payload().payload_source_case(),
+            xla::Payload::kValue);
+}
+
+TEST(HloModuleTest, InvalidMetadataIdFails) {
+  HloModuleProto proto;
+  proto.set_name("test_module");
+  proto.set_entry_computation_id(1);
+  ProgramShapeProto program_shape;
+  *program_shape.mutable_result() = ShapeUtil::MakeShape(F32, {}).ToProto();
+  *proto.mutable_host_program_shape() = program_shape;
+  proto.add_payloads("abc");  // payloads size is 1 (valid ID is 0 only)
+
+  HloComputationProto* comp_proto = proto.add_computations();
+  comp_proto->set_id(1);
+  comp_proto->set_name("comp");
+  comp_proto->set_root_id(0);
+
+  HloInstructionProto* inst_proto = comp_proto->add_instructions();
+  inst_proto->set_id(0);
+  inst_proto->set_name("inst");
+  inst_proto->set_opcode("parameter");
+  *inst_proto->mutable_shape() = ShapeUtil::MakeShape(F32, {}).ToProto();
+  inst_proto->mutable_metadata()->mutable_metadata_payload()->set_id(
+      5);  // Invalid ID!
+
+  TF_ASSERT_OK_AND_ASSIGN(HloModuleConfig config,
+                          HloModule::CreateModuleConfigFromProto(
+                              proto, GetDebugOptionsFromFlags()));
+  absl::Status status = HloModule::CreateFromProto(proto, config).status();
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.message(),
+              ::testing::HasSubstr("Invalid metadata payload id 5"));
+}
+
+TEST(HloModuleTest, CloneWorksNaturally) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("abc");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  std::unique_ptr<HloModule> cloned = m.Clone();
+  const HloInstruction* cloned_inst =
+      cloned->entry_computation()->root_instruction();
+
+  EXPECT_TRUE(cloned_inst->has_metadata_payload());
+  EXPECT_EQ(cloned_inst->metadata_payload_string(), "abc");
+  EXPECT_EQ(cloned_inst->metadata().metadata_payload().payload_source_case(),
+            xla::Payload::kValue);
+}
+
+TEST(HloModuleTest, PreFilledProtoSafety) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("new_payload");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto;
+  proto.add_payloads("existing_payload");
+  HloComputationProto* existing_comp = proto.add_computations();
+  existing_comp->set_id(0);
+  existing_comp->set_name("existing_comp");
+  existing_comp->set_root_id(0);
+  HloInstructionProto* existing_inst = existing_comp->add_instructions();
+  existing_inst->set_id(0);
+  existing_inst->set_name("existing_inst");
+  existing_inst->set_opcode("parameter");
+  *existing_inst->mutable_shape() = ShapeUtil::MakeShape(F32, {}).ToProto();
+
+  // Serialize on top of pre-filled proto
+  m.ToProto(&proto, HloProtoOptions());
+
+  // Expect:
+  // - payloads: ["existing_payload", "new_payload"]
+  // - new computation metadata id is shifted by 1 pointing to index 1
+  ASSERT_EQ(proto.payloads_size(), 2);
+  EXPECT_EQ(proto.payloads(0), "existing_payload");
+  EXPECT_EQ(proto.payloads(1), "new_payload");
+
+  // New instruction points to ID 1
+  const HloInstructionProto& new_inst_proto =
+      proto.computations(1).instructions(0);
+  EXPECT_EQ(new_inst_proto.metadata().metadata_payload().id(), 1);
+
+  // Existing computation instructions are COMPLETELY untouched (no metadata
+  // added or modified!)
+  const HloInstructionProto& old_inst_proto =
+      proto.computations(0).instructions(0);
+  EXPECT_FALSE(old_inst_proto.has_metadata());
+}
+
+TEST(HloModuleTest, OrdinaryMetadataNotPolluted) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+
+  // Set standard metadata but NO interned payload!
+  OpMetadata metadata;
+  metadata.set_op_name("x");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto = m.ToProto(HloProtoOptions());
+
+  const HloInstructionProto& inst_proto = proto.computations(0).instructions(0);
+  EXPECT_TRUE(inst_proto.has_metadata());
+  EXPECT_EQ(inst_proto.metadata().op_name(), "x");
+
+  // Must NOT contain an empty metadata_payload field!
+  EXPECT_FALSE(inst_proto.metadata().has_metadata_payload());
+}
+
+TEST(HloModuleTest, NoDeduplicateMetadataOption) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("abc");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto = m.ToProto(HloProtoOptions{
+      /*deduplicate_backend_config=*/false, /*deduplicate_metadata=*/false});
+
+  // Payloads array must be completely empty!
+  ASSERT_EQ(proto.payloads_size(), 0);
+
+  // Value is stored directly inline inside the instruction metadata!
+  const HloInstructionProto& inst_proto = proto.computations(0).instructions(0);
+  EXPECT_TRUE(inst_proto.has_metadata());
+  EXPECT_TRUE(inst_proto.metadata().has_metadata_payload());
+  EXPECT_EQ(inst_proto.metadata().metadata_payload().payload_source_case(),
+            xla::Payload::kValue);
+  EXPECT_EQ(inst_proto.metadata().metadata_payload().value(), "abc");
+}
+
+TEST(HloModuleTest, TextHloRoundtripStrict) {
+  const char* hlo_text = R"(
+    HloModule text_module
+    ENTRY comp {
+      ROOT inst = f32[] parameter(0), metadata={metadata_payload="abc"}
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnUnverifiedModule(hlo_text));
+
+  // 1. Verify initial parsed state
+  const HloInstruction* inst = m->entry_computation()->root_instruction();
+  EXPECT_TRUE(inst->has_metadata_payload());
+  EXPECT_EQ(inst->metadata_payload_string(), "abc");
+
+  // 2. Print textual representation
+  std::string printed = m->ToString();
+
+  // 3. Parse the printed textual HLO string back again!
+  TF_ASSERT_OK_AND_ASSIGN(auto m_again,
+                          ParseAndReturnUnverifiedModule(printed));
+  const HloInstruction* inst_again =
+      m_again->entry_computation()->root_instruction();
+
+  // 4. Verify strict round-trip equivalence
+  EXPECT_TRUE(inst_again->has_metadata_payload());
+  EXPECT_EQ(inst_again->metadata_payload_string(), "abc");
+}
+
+TEST(HloModuleTest, CombinedDeduplicationSharesPayloadId) {
+  HloModule m("test_module", HloModuleConfig());
+  HloComputation::Builder builder("comp");
+  Shape shape = ShapeUtil::MakeShape(F32, {});
+  HloInstruction* inst =
+      builder.AddInstruction(HloInstruction::CreateParameter(0, shape, "inst"));
+
+  // Set identical backend config and interned metadata value!
+  inst->set_raw_backend_config_string("abc");
+  OpMetadata metadata;
+  metadata.mutable_metadata_payload()->set_value("abc");
+  inst->set_metadata(metadata);
+  m.AddEntryComputation(builder.Build());
+
+  HloModuleProto proto = m.ToProto(HloProtoOptions{
+      /*deduplicate_backend_config=*/true, /*deduplicate_metadata=*/true});
+
+  // Verify that the unified payloads array has EXACTLY 1 shared payload entry!
+  ASSERT_EQ(proto.payloads_size(), 1);
+  EXPECT_EQ(proto.payloads(0), "abc");
+
+  // Both backend config and metadata must point to ID 0!
+  const HloInstructionProto& inst_proto = proto.computations(0).instructions(0);
+  EXPECT_TRUE(inst_proto.has_backend_config_payload());
+  EXPECT_EQ(inst_proto.backend_config_payload().id(), 0);
+
+  EXPECT_TRUE(inst_proto.has_metadata());
+  EXPECT_TRUE(inst_proto.metadata().has_metadata_payload());
+  EXPECT_EQ(inst_proto.metadata().metadata_payload().id(), 0);
 }
 
 }  // namespace

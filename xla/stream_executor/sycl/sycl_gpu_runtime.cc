@@ -279,16 +279,8 @@ absl::StatusOr<StreamPtr> SyclStreamPool::GetOrCreateStream(
   ASSIGN_OR_RETURN(StreamPool * stream_pool,
                    SyclStreamPool::InitStreamPool(device_ordinal));
   // If multiple streams are enabled, create a new stream and add it
-  // to the pool, unless the pool has reached kMaxStreamsPerDevice.
+  // to the pool.
   absl::MutexLock write_lock(&stream_pool_mu_);
-  if (stream_pool->size() >= kMaxStreamsPerDevice) {
-    VLOG(2) << "Stream pool size for device ordinal " << device_ordinal
-            << " exceeds the maximum limit of " << kMaxStreamsPerDevice;
-    return absl::ResourceExhaustedError(
-        absl::StrCat("SyclStreamPool::GetOrCreateStream: Maximum number of "
-                     "streams reached for device ordinal ",
-                     device_ordinal, "."));
-  }
   VLOG(2) << "Stream pool size for device ordinal " << device_ordinal << ": "
           << stream_pool->size();
   ::sycl::property_list prop_list{::sycl::property::queue::enable_profiling(),
@@ -415,15 +407,21 @@ absl::Status SyclStreamSynchronize(::sycl::queue* stream_handle) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::optional<::sycl::event>> SyclGetRecentEventFromStream(
+absl::StatusOr<::sycl::event> SyclGetRecentEventFromStream(
     ::sycl::queue* stream_handle) {
   try {
-    // Use the new DPC++/SYCL API when oneAPI version is at least 2024.2.
-    std::optional<::sycl::event> event =
-        IsOneAPIVersionAtLeast2024_2()
-            ? stream_handle->ext_oneapi_get_last_event()
-            : stream_handle->ext_oneapi_submit_barrier();
-    return event;
+    if (IsOneAPIVersionAtLeast2024_2()) {
+      // Zero overhead: Does not submit a barrier or enqueue work.
+      std::optional<::sycl::event> event =
+          stream_handle->ext_oneapi_get_last_event();
+      if (event.has_value()) {
+        return event.value();
+      }
+      // Submit a barrier if no prior event exists.
+      return stream_handle->ext_oneapi_submit_barrier();
+    }
+    // Always submit a barrier on older oneAPI versions.
+    return stream_handle->ext_oneapi_submit_barrier();
   } catch (const ::sycl::exception& e) {
     return absl::InternalError(absl::StrCat(
         "SyclGetRecentEventFromStream: Failed to get event from stream: ",

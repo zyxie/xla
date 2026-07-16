@@ -200,11 +200,8 @@ CollectiveConfig GetCollectiveConfig(
                           .value();
 
   config.use_symmetric_buffer =
-      hlo->GetModule() &&
-      hlo->GetModule()
-          ->config()
-          .debug_options()
-          .xla_gpu_experimental_enable_nccl_symmetric_buffers();
+      hlo->GetModule() && IsNcclSymmetricBuffersEnabledForCollective(
+                              hlo, hlo->GetModule()->config().debug_options());
   return config;
 }
 
@@ -212,7 +209,7 @@ CollectiveThunk::CollectiveThunk(Kind kind, ThunkInfo thunk_info,
                                  std::vector<Buffer> buffers,
                                  CommunicationId communication_id,
                                  CollectivesMode collectives_mode)
-    : Command(CommandType::kCollectiveCmd, kind, std::move(thunk_info)),
+    : Command(kind, std::move(thunk_info)),
       buffers_(std::move(buffers)),
       communication_id_(communication_id),
       collectives_mode_(collectives_mode) {}

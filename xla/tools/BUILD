@@ -416,7 +416,9 @@ cc_library(
         "//xla/hlo/translate/stablehlo_to_hlo:translate",
         "//xla/service:hlo_module_config",
         "//xla/service:hlo_proto_cc",
+        "//xla/tsl/platform:env",
         "//xla/tsl/platform:status_macros",
+        "//xla/util/split_proto:split_proto_reader",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -424,6 +426,7 @@ cc_library(
         "@com_google_protobuf//:protobuf",
         "@com_googlesource_code_re2//:re2",
         "@llvm-project//llvm:Support",
+        "@riegeli//riegeli/bytes:string_reader",
         "@tsl//tsl/platform:env",
         "@tsl//tsl/platform:errors",
         "@tsl//tsl/platform:logging",
@@ -438,11 +441,17 @@ xla_cc_test(
     srcs = ["hlo_module_loader_test.cc"],
     deps = [
         ":hlo_module_loader",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:hlo_proto_cc",
+        "//xla/service:hlo_proto_util",
         "//xla/tests:xla_internal_test_main",  # fixdeps: keep
-        "//xla/tsl/lib/core:status_test_util",
+        "//xla/util/split_proto:split_hlo_writer",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest",
-        "@tsl//tsl/platform:test",
+        "@riegeli//riegeli/bytes:string_writer",
+        "@tsl//tsl/platform:status_matchers",
     ],
 )
 
@@ -486,6 +495,21 @@ tf_proto_library(
     deps = [
         "//xla:xla_data_proto",
     ],
+)
+
+tf_proto_library(
+    name = "debug_event_proto",
+    srcs = ["debug_event.proto"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla:xla_data_proto",
+    ],
+)
+
+xla_py_proto_library(
+    name = "debug_event_pb2",
+    visibility = ["//visibility:public"],
+    deps = [":debug_event_proto"],
 )
 
 xla_py_proto_library(
@@ -569,7 +593,10 @@ xla_cc_test(
         "//xla:literal",
         "//xla:literal_util",
         "//xla:xla_data_proto_cc",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/service:hlo_runner",
         "//xla/tsl/lib/core:status_test_util",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
         "@tsl//tsl/platform:env",
         "@tsl//tsl/platform:test",
@@ -846,10 +873,9 @@ cc_library(
     ],
 )
 
-cc_library(
-    name = "collective_perf_table_gen_main_lib",
+xla_cc_binary(
+    name = "collective_perf_table_gen_main",
     srcs = ["collective_perf_table_gen_main.cc"],
-    compatible_with = None,
     tags = [
         "no_mac",
     ],
@@ -860,7 +886,6 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/parser:hlo_parser",
-        "//xla/service/gpu/model:collective_interpolator_data",
         "//xla/service/gpu/model:hlo_op_profile_proto_cc",
         "//xla/tsl/platform:env",
         "//xla/tsl/platform:errors",
@@ -884,7 +909,6 @@ cc_library(
         "//xla/service:gpu_plugin",
         "//xla/stream_executor:rocm_platform",
     ]),
-    alwayslink = True,
 )
 
 cc_library(
@@ -948,16 +972,6 @@ xla_test(
         "//xla/service/gpu/model:hlo_op_profile_proto_cc",
         "@com_google_absl//absl/log",
         "@com_google_googletest//:gtest_main",
-    ],
-)
-
-xla_cc_binary(
-    name = "collective_perf_table_gen_main",
-    tags = [
-        "no_mac",
-    ],
-    deps = [
-        ":collective_perf_table_gen_main_lib",
     ],
 )
 
@@ -1091,6 +1105,23 @@ cc_library(
 )
 
 cc_library(
+    name = "xla_cpu_compile_lib",
+    srcs = ["xla_cpu_compile_lib.cc"],
+    hdrs = ["xla_cpu_compile_lib.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla/backends/cpu:target_machine_options",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:compiled_module",
+        "//xla/service:compiler",
+        "//xla/service:executable",
+        "//xla/service/cpu:cpu_compiler_pure",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "xla_compile_lib",
     srcs = ["xla_compile_lib.cc"],
     hdrs = ["xla_compile_lib.h"],
@@ -1109,6 +1140,7 @@ cc_library(
     deps = [
         ":hlo_module_loader",
         ":llvm_targets",  # fixdeps: keep
+        ":xla_cpu_compile_lib",
         "//xla:debug_options_flags",
         "//xla:shape_util",
         "//xla:util",
@@ -1252,6 +1284,7 @@ xla_test(
         "//xla/tsl/platform:test",
         "//xla/tsl/protobuf:error_codes_proto_impl_cc",
         "//xla/tsl/protobuf:status_proto_cc",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
@@ -1271,12 +1304,14 @@ xla_cc_test(
     tags = ["gpu"],
     deps = [
         ":xla_compile_lib",
+        "//xla:shape_util",
         "//xla:xla_proto_cc",
         "//xla/backends/gpu/target_config",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/parser:hlo_parser",
         "//xla/service:compiler",
         "//xla/service:gpu_plugin",
+        "//xla/service:hlo_module_config",
         "//xla/service:platform_util",
         "//xla/service:symbol_repository",
         "//xla/service:xla_compile_result_proto_cc_impl",
@@ -1450,6 +1485,25 @@ cc_binary(
         "@riegeli//riegeli/bytes:copy_all",
         "@riegeli//riegeli/bytes:std_io",
         "@riegeli//riegeli/zstd:zstd_writer",
+        "@tsl//tsl/platform:platform_port",
+    ],
+)
+
+cc_binary(
+    name = "count_hlo_ops",
+    srcs = ["count_hlo_ops.cc"],
+    deps = [
+        ":hlo_module_loader",
+        "//xla:debug_options_flags",
+        "//xla:xla_data_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "//xla/tsl/platform:status_macros",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
         "@tsl//tsl/platform:platform_port",
     ],
 )

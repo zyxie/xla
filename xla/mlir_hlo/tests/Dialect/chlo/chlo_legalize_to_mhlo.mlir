@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenXLA Authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ==============================================================================
 // RUN: mlir-hlo-opt --chlo-legalize-to-hlo --split-input-file -verify-diagnostics %s | FileCheck %s --dump-input-context=20
 // RUN: mlir-hlo-opt --chlo-legalize-to-high-level-mhlo="enable-acosh enable-acos enable-atanh enable-cosh enable-sinh enable-asin enable-asinh" --split-input-file -verify-diagnostics %s | FileCheck %s --check-prefix=CHECK-HIGH-LEVEL
 
@@ -2756,6 +2770,18 @@ func.func @top_k(%arg : tensor<16x16xf32>) -> (tensor<16x8xf32>, tensor<16x8xi32
 
 // -----
 
+// CHECK-LABEL: func.func @top_k_unstable
+// CHECK-HIGH-LEVEL-LABEL: func.func @top_k_unstable
+// CHECK-SAME: (%[[ARG:.*]]: tensor<16x16xf32>)
+func.func @top_k_unstable(%arg : tensor<16x16xf32>) -> (tensor<16x8xf32>, tensor<16x8xi32>) {
+  // CHECK-HIGH-LEVEL: mhlo.topk
+  // CHECK: %values, %indices = mhlo.topk(%[[ARG]], k = 8, is_stable = false) : tensor<16x16xf32> -> (tensor<16x8xf32>, tensor<16x8xi32>)
+  %1:2 = chlo.top_k(%arg, k=8, is_stable = false) : tensor<16x16xf32> -> (tensor<16x8xf32>, tensor<16x8xi32>)
+  func.return %1#0, %1#1 : tensor<16x8xf32>, tensor<16x8xi32>
+}
+
+// -----
+
 // CHECK-LABEL: func.func @dyn_top_k
 // CHECK-HIGH-LEVEL-LABEL: func.func @dyn_top_k
 // CHECK-SAME: ([[ARG:%.*]]: tensor<?x5x?xi1>
@@ -3585,7 +3611,8 @@ func.func @ragged_dot_contracting(%lhs : tensor<2x11x5xf32>, %rhs : tensor<2x5x7
 // CHECK-LABEL: func.func @ragged_dot_batch
 // CHECK-HIGH-LEVEL-LABEL: func.func @ragged_dot_batch
 func.func @ragged_dot_batch(%lhs : tensor<19x17x11x5xf32>, %rhs : tensor<19x17x5x7xf32>, %group_sizes : tensor<19x3xi64>) -> tensor<19x17x11x7xf32> {
-  // CHECK-HIGH-LEVEL: mhlo.ragged_dot
+  // CHECK: "mhlo.dot_general"{{.*}}lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]
+  // CHECK-HIGH-LEVEL: "mhlo.dot_general"{{.*}}lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]
   %0 = "chlo.ragged_dot"(%lhs, %rhs, %group_sizes) {
     ragged_dot_dimension_numbers = #chlo.ragged_dot<
       lhs_batching_dimensions = [0,1],
@@ -3680,4 +3707,3 @@ func.func @mulhi_i16(%arg0 : tensor<4xi16>, %arg1 : tensor<4xi16>) -> tensor<4xi
   %result = "chlo.mulhi"(%arg0, %arg1) : (tensor<4xi16>, tensor<4xi16>) -> tensor<4xi16>
   func.return %result : tensor<4xi16>
 }
-

@@ -24,6 +24,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/base/casts.h"
 #include "absl/base/const_init.h"
 #include "absl/base/no_destructor.h"
 #include "absl/base/thread_annotations.h"
@@ -51,6 +52,7 @@ limitations under the License.
 #include "xla/megascale/c_api_client/c_api_megascale_error_aggregator.h"
 #include "xla/megascale/c_api_client/megascale_types.h"
 #include "xla/megascale/dcn_topology.pb.h"
+#include "xla/megascale/megascale_runtime_error_overlay.pb.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_collectives_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_helpers.h"
@@ -524,9 +526,9 @@ absl::StatusOr<std::unique_ptr<xla::MultiSliceConfig>> CreateAoTMegascaleConfig(
 
   PJRT_Megascale_CreateAoTConfig_Args args;
   args.struct_size = PJRT_Megascale_CreateAoTConfig_Args_STRUCT_SIZE;
-  args.topology = tsl::down_cast<const xla::PjRtCApiTopologyDescription&>(
-                      topology_description)
-                      .c_topology();
+  args.topology =
+      absl::down_cast<const PjRtCApiTopologyDescription&>(topology_description)
+          .c_topology();
   args.num_slices = num_slices;
   args.multi_slice_config = nullptr;
 
@@ -568,9 +570,9 @@ CreateMultiSliceMegascaleConfig(
 
   PJRT_Megascale_CreateMultiSliceConfig_Args args;
   args.struct_size = PJRT_Megascale_CreateMultiSliceConfig_Args_STRUCT_SIZE;
-  args.topology = tsl::down_cast<const xla::PjRtCApiTopologyDescription&>(
-                      topology_description)
-                      .c_topology();
+  args.topology =
+      absl::down_cast<const PjRtCApiTopologyDescription&>(topology_description)
+          .c_topology();
   args.num_slices = num_slices;
   args.local_slice_id = local_slice_id;
   args.local_host_id = local_host_id;
@@ -591,8 +593,7 @@ CreateMultiSliceMegascaleConfig(
 
 absl::StatusOr<std::shared_ptr<CApiPjRtClientContext>>
 MegaScaleClientContextFromClient(xla::PjRtClient* client) {
-  xla::PjRtCApiClient* c_api_client =
-      tsl::down_cast<xla::PjRtCApiClient*>(client);
+  xla::PjRtCApiClient* c_api_client = absl::down_cast<PjRtCApiClient*>(client);
   const PJRT_Api* c_api = c_api_client->pjrt_c_api();
   const PJRT_Megascale_Extension* extension =
       c_api_client->FindExtension<PJRT_Megascale_Extension>(

@@ -659,8 +659,8 @@ absl::StatusOr<std::unique_ptr<Kernel>> RocmExecutor::LoadKernel(
   const std::string& kernel_name = spec.kernel_name();
 
   if (spec.has_cuda_cubin_in_memory()) {
-    const auto& cubin = spec.cuda_cubin_in_memory()->cubin_bytes;
-    const char* hsaco = reinterpret_cast<const char*>(cubin.data());
+    const char* hsaco = reinterpret_cast<const char*>(
+        spec.cuda_cubin_in_memory()->cubin_bytes.data());
     absl::MutexLock lock{in_memory_modules_mu_};
     ASSIGN_OR_RETURN(ModuleHandle module_handle, LoadModuleFromHsaco(hsaco));
     hipModule_t module = gpu_binary_to_module_.at(module_handle).first;
@@ -676,17 +676,12 @@ absl::StatusOr<std::unique_ptr<Kernel>> RocmExecutor::LoadKernel(
 
     VLOG(1) << "Resolve ROCM kernel " << kernel_name
             << " from symbol pointer: " << symbol;
-
-#if TF_ROCM_VERSION >= 60200
+    ScopedActivateContext activation(&rocm_context_);
     hipFunction_t func;
     RETURN_IF_ERROR(
         ToStatus(hipGetFuncBySymbol(&func, spec.in_process_symbol()->symbol),
                  "Failed call to hipGetFuncBySymbol"));
     rocm_kernel->set_gpu_function(func);
-#else
-    rocm_kernel->set_gpu_function(
-        static_cast<hipFunction_t>(spec.in_process_symbol().symbol()));
-#endif  // TF_ROCM_VERSION >= 60200
 
   } else {
     return absl::InternalError("No method of loading ROCM kernel provided");
@@ -768,14 +763,6 @@ DeviceAddressBase RocmExecutor::Allocate(uint64_t size, int64_t memory_space) {
       return DeviceAddressBase(
           DeviceAllocate(&rocm_context_, size, /*is_fine_grained*/ false),
           size);
-    case MemorySpace::kP2P:
-      // On the ROCm platform, differences in cache design (e.g., coherence
-      // protocol) can cause cache coherence issues for some archs (e.g., MI200)
-      // when using normal device memory. To avoid these problems, we use
-      // fine-grained memory in P2P communication for all archs to make sure of
-      // the correctness.
-      return DeviceAddressBase(
-          DeviceAllocate(&rocm_context_, size, /*is_fine_grained*/ true), size);
     case MemorySpace::kHost:
       if (auto result = HostAllocate(&rocm_context_, size); result.ok()) {
         return DeviceAddressBase(*result, size);
@@ -1291,6 +1278,35 @@ absl::StatusOr<MemorySpace> RocmExecutor::GetPointerMemorySpace(
 
   return absl::InternalError(absl::StrCat(
       "failed to query device pointer for memory space: ", ToString(result)));
+}
+
+bool RocmExecutor::IsHostMemoryPinned(const void* ptr, uint64_t size) {
+  if (size == 0) {
+    return false;
+  }
+  // hipDrvPointerGetAttributes does not modify pointer but is nonconst.
+  hipDeviceptr_t pointer =
+      reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(ptr));
+
+  uint64_t start_addr;
+  uint64_t range_size;
+  unsigned int memory_type;
+  hipPointer_attribute attrs[3] = {HIP_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                   HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                   HIP_POINTER_ATTRIBUTE_RANGE_SIZE};
+  void* results[3] = {&memory_type, &start_addr, &range_size};
+  hipError_t result = hipDrvPointerGetAttributes(3, attrs, results, pointer);
+
+  if (result != hipSuccess) {
+    return false;
+  }
+
+  if (memory_type != hipMemoryTypeHost) {
+    return false;
+  }
+
+  return reinterpret_cast<const char*>(ptr) + size <=
+         reinterpret_cast<const char*>(start_addr) + range_size;
 }
 
 absl::StatusOr<const RocmKernel*> RocmExecutor::GetRocmKernel(

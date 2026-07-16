@@ -47,6 +47,10 @@ class PrimitiveType(enum.IntEnum):
 
   F4E2M1FN = 32
 
+  F6E2M3FN = 36
+
+  F6E3M2FN = 35
+
   F8E3M4 = 29
 
   F8E4M3 = 28
@@ -230,119 +234,121 @@ class HloOpcode(enum.Enum):
 
   kMinimum = 74
 
-  kMultiply = 75
+  kMulhi = 75
 
-  kNegate = 76
+  kMultiply = 76
 
-  kNot = 77
+  kNegate = 77
 
-  kOptimizationBarrier = 78
+  kNot = 78
 
-  kOr = 79
+  kOptimizationBarrier = 79
 
-  kOutfeed = 80
+  kOr = 80
 
-  kPad = 81
+  kOutfeed = 81
 
-  kParameter = 82
+  kPad = 82
 
-  kPartitionId = 83
+  kParameter = 83
 
-  kPopulationCount = 84
+  kPartitionId = 84
 
-  kPower = 85
+  kPopulationCount = 85
 
-  kRaggedAllToAll = 86
+  kPower = 86
 
-  kRaggedDot = 87
+  kRaggedAllToAll = 87
 
-  kReal = 88
+  kRaggedDot = 88
 
-  kRecv = 89
+  kReal = 89
 
-  kRecvDone = 90
+  kRecv = 90
 
-  kReduce = 91
+  kRecvDone = 91
 
-  kReducePrecision = 92
+  kReduce = 92
 
-  kReduceScatter = 93
+  kReducePrecision = 93
 
-  kReduceWindow = 94
+  kReduceScatter = 94
 
-  kRemainder = 95
+  kReduceWindow = 95
 
-  kReplicaId = 96
+  kRemainder = 96
 
-  kReshape = 97
+  kReplicaId = 97
 
-  kReverse = 98
+  kReshape = 98
 
-  kRng = 99
+  kReverse = 99
 
-  kRngBitGenerator = 100
+  kRng = 100
 
-  kRngGetAndUpdateState = 101
+  kRngBitGenerator = 101
 
-  kRoundNearestAfz = 102
+  kRngGetAndUpdateState = 102
 
-  kRoundNearestEven = 103
+  kRoundNearestAfz = 103
 
-  kRsqrt = 104
+  kRoundNearestEven = 104
 
-  kScaledDot = 105
+  kRsqrt = 105
 
-  kScan = 106
+  kScaledDot = 106
 
-  kScatter = 107
+  kScan = 107
 
-  kSelect = 108
+  kScatter = 108
 
-  kSelectAndScatter = 109
+  kSelect = 109
 
-  kSend = 110
+  kSelectAndScatter = 110
 
-  kSendDone = 111
+  kSend = 111
 
-  kSetDimensionSize = 112
+  kSendDone = 112
 
-  kShiftLeft = 113
+  kSetDimensionSize = 113
 
-  kShiftRightArithmetic = 114
+  kShiftLeft = 114
 
-  kShiftRightLogical = 115
+  kShiftRightArithmetic = 115
 
-  kSign = 116
+  kShiftRightLogical = 116
 
-  kSin = 117
+  kSign = 117
 
-  kSinh = 118
+  kSin = 118
 
-  kSlice = 119
+  kSinh = 119
 
-  kSort = 120
+  kSlice = 120
 
-  kSqrt = 121
+  kSort = 121
 
-  kStochasticConvert = 122
+  kSqrt = 122
 
-  kSubtract = 123
+  kStochasticConvert = 123
 
-  kTan = 124
+  kSubtract = 124
 
-  kTanh = 125
+  kTan = 125
 
-  kTopK = 126
+  kTanh = 126
 
-  kTranspose = 127
+  kTopK = 127
 
-  kTriangularSolve = 128
+  kTranspose = 128
 
-  kTuple = 129
+  kTriangularSolve = 129
 
-  kWhile = 130
+  kTuple = 130
 
-  kXor = 131
+  kWhile = 131
+
+  kXor = 132
 
 class Layout:
   @overload
@@ -375,9 +381,7 @@ class Shape:
       dims: Sequence[int],
       layout: Sequence[int] | None = ...,
       dynamic_dimensions: Sequence[bool] | None = ...,
-  ) -> Shape:
-    """Constructs an array shape."""
-
+  ) -> Shape: ...
   @overload
   @staticmethod
   def array_shape(
@@ -385,17 +389,19 @@ class Shape:
       dims: Sequence[int],
       layout: Sequence[int] | None = ...,
       dynamic_dimensions: Sequence[bool] | None = ...,
-  ) -> Shape: ...
+  ) -> Shape:
+    """Constructs an array shape."""
+
   @staticmethod
   def token_shape() -> Shape: ...
   @overload
   @staticmethod
-  def scalar_shape(type: PrimitiveType) -> Shape:
-    """Constructs a scalar shape."""
-
+  def scalar_shape(type: PrimitiveType) -> Shape: ...
   @overload
   @staticmethod
-  def scalar_shape(type: numpy.dtype) -> Shape: ...
+  def scalar_shape(type: numpy.dtype) -> Shape:
+    """Constructs a scalar shape."""
+
   def dimensions(self) -> tuple[int, ...]: ...
   def layout(self) -> Layout: ...
   def xla_element_type(self) -> PrimitiveType: ...
@@ -531,6 +537,10 @@ class HloInstruction:
   def users(self) -> list[HloInstruction]: ...
   def operands(self) -> list[HloInstruction]: ...
   def async_wrapped_root(self) -> HloInstruction: ...
+  def get_frontend_attribute(self, key: str) -> str | None: ...
+  def set_frontend_attribute(self, key: str, value: str) -> None: ...
+  def set_core_assignment(self, core_ids: Sequence[int]) -> None: ...
+  def core_assignment(self) -> list[int]: ...
   def __hash__(self) -> int: ...
   def __eq__(self, arg: HloInstruction, /) -> bool: ...
 
@@ -542,6 +552,9 @@ class HloComputation:
   def replace_instruction(
       self, arg0: HloInstruction, arg1: HloInstruction, /
   ) -> None: ...
+  def create_unary_instruction(
+      self, arg0: HloOpcode, arg1: HloInstruction, /
+  ) -> HloInstruction: ...
 
 class HloSchedule:
   def to_string(self) -> str: ...
@@ -698,6 +711,7 @@ class HloSharding:
   def __repr__(self) -> str: ...
   def to_proto(self) -> OpSharding: ...
   def get_axis_sizes(self) -> list[int]: ...
+  def v3_to_v2_sharding(self) -> HloSharding: ...
 
 def hlo_module_to_dot_graph(arg: HloModule, /) -> str: ...
 def hlo_module_from_text(arg: str, /) -> HloModule: ...

@@ -148,7 +148,8 @@ bool IsSupportedCudnnFusion(const HloInstruction& instr,
   }
 
   if (hero->opcode() == HloOpcode::kConvolution ||
-      hero->opcode() == HloOpcode::kRaggedDot) {
+      hero->opcode() == HloOpcode::kRaggedDot ||
+      hero->opcode() == HloOpcode::kScaledDot) {
     return true;
   }
 
@@ -244,18 +245,42 @@ absl::StatusOr<std::vector<CudnnBackendConfig>> GetAlgorithms(
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
 GetCudnnFusionConfigs(const HloInstruction& instr,
-                      se::StreamExecutor* stream_executor) {
+                      se::StreamExecutor* stream_executor,
+                      const Compiler::GpuTargetConfig& target_config,
+                      const DebugOptions& debug_options) {
   std::vector<std::unique_ptr<BackendConfig>> configs;
-  int plan_count = CuDnnFusionCompiler::GetAvailablePlanCount(
-      *stream_executor, *DynCast<HloFusionInstruction>(&instr));
+  bool use_deviceless = false;
+  switch (debug_options.xla_gpu_cudnn_deviceless_compilation_mode()) {
+    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_UNSET:
+    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_DISABLED:
+      use_deviceless = false;
+      break;
+    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_ALWAYS:
+      use_deviceless = true;
+      break;
+    case DebugOptions::CUDNN_DEVICELESS_COMPILATION_AUTO:
+    default:
+      use_deviceless = (stream_executor == nullptr);
+      break;
+  }
+  if (use_deviceless) {
+    if (target_config.dnn_version_info < se::dnn::VersionInfo(9, 8, 0)) {
+      return absl::FailedPreconditionError(
+          "Deviceless cuDNN compilation requires cuDNN >= 9.8.");
+    }
+    stream_executor = nullptr;
+  }
+  ASSIGN_OR_RETURN(int plan_count,
+                   CuDnnFusionCompiler::GetAvailablePlanCount(
+                       stream_executor, target_config.device_description,
+                       *DynCast<HloFusionInstruction>(&instr)));
+
   VLOG(2) << "Found " << plan_count << " plans for cudnn fusion.";
   configs.reserve(plan_count);
   for (int plan_id = 0; plan_id < plan_count; ++plan_id) {
-    CudnnBackendConfig config;
-    config.set_algo_id(plan_id);
-    auto any = std::make_unique<google::protobuf::Any>();
-    any->PackFrom(config);
-    configs.push_back(std::move(any));
+    auto config = std::make_unique<BackendConfig>();
+    config->mutable_algorithm()->set_algo_id(plan_id);
+    configs.push_back(std::move(config));
   }
   return configs;
 }
@@ -302,9 +327,9 @@ GetConvolutionCustomCallConfigs(const HloCustomCallInstruction* instr,
   std::vector<std::unique_ptr<BackendConfig>> configs;
   configs.reserve(algorithm_configs.size());
   for (const auto& algorithm_config : algorithm_configs) {
-    auto any = std::make_unique<google::protobuf::Any>();
-    any->PackFrom(algorithm_config);
-    configs.push_back(std::move(any));
+    auto config = std::make_unique<BackendConfig>();
+    *config->mutable_algorithm() = algorithm_config;
+    configs.push_back(std::move(config));
   }
   return configs;
 }
@@ -354,17 +379,16 @@ absl::StatusOr<std::unique_ptr<BackendConfig>> CudnnBackend::GetDefaultConfig(
   if (IsCustomCallToDnnConvolution(instr)) {
     // If the instruction is a custom call to a DnnConvolution, we can return
     // the default config.
-    CudnnBackendConfig config;
-    config.set_algo_id(-1);
-    auto any = std::make_unique<google::protobuf::Any>();
-    any->PackFrom(config);
-    return any;
+    auto config = std::make_unique<BackendConfig>();
+    config->mutable_algorithm()->set_algo_id(-1);
+    return config;
   }
 
   if (stream_executor() != nullptr && instr.opcode() == HloOpcode::kFusion &&
       IsSupportedCudnnFusion(instr, stream_executor(), debug_options())) {
     ASSIGN_OR_RETURN(std::vector<std::unique_ptr<BackendConfig>> configs,
-                     GetCudnnFusionConfigs(instr, stream_executor()));
+                     GetCudnnFusionConfigs(instr, stream_executor(),
+                                           target_config(), debug_options()));
     if (!configs.empty()) {
       return std::move(configs[0]);
     }
@@ -380,7 +404,8 @@ CudnnBackend::GetSupportedConfigs(const HloInstruction& instr) {
     return std::vector<std::unique_ptr<BackendConfig>>();
   }
   if (instr.opcode() == HloOpcode::kFusion) {
-    return GetCudnnFusionConfigs(instr, stream_executor());
+    return GetCudnnFusionConfigs(instr, stream_executor(), target_config(),
+                                 debug_options());
   }
   if (IsCustomCallToDnnConvolution(instr)) {
     auto custom_call_instr = Cast<HloCustomCallInstruction>(&instr);
@@ -393,11 +418,11 @@ CudnnBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
 absl::Status CudnnBackend::ApplyConfig(HloInstruction& instr,
                                        const BackendConfig& config) {
-  CudnnBackendConfig algorithm_config;
-  if (!config.UnpackTo(&algorithm_config)) {
+  if (!config.has_algorithm()) {
     return absl::InvalidArgumentError(
-        "Failed to unpack CudnnBackendConfig from Any.");
+        "Expected AlgorithmProto config for CudnnBackend.");
   }
+  const CudnnBackendConfig& algorithm_config = config.algorithm();
   if (instr.opcode() == HloOpcode::kFusion) {
     return ApplyConfigToCudnnFusion(instr, algorithm_config);
   }

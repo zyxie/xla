@@ -1,10 +1,11 @@
 load(
     "//xla:xla.default.bzl",
     "xla_cc_test",
+    "xla_internal",
 )
 load("//xla/tests:build_defs.bzl", "xla_test")
 load("//xla/tsl:tsl.bzl", "internal_visibility", "tsl_copts")
-load("//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable")
+load("//xla/tsl:tsl.default.bzl", "filegroup", "get_compatible_with_portable", "if_include_google_deps")
 load("//xla/tsl/mkl:build_defs.bzl", "if_graph_api", "if_onednn")
 load("//xla/tsl/mkl:graph.bzl", "onednn_cc_library")
 load("//xla/tsl/platform:build_config.bzl", "tf_proto_library")
@@ -141,6 +142,7 @@ cc_library(
         ":cpu_options",
         ":dot_op_emitter",
         ":executable_proto_cc",
+        ":export_hlo",
         ":fusion_wrapper",
         ":ir_emission_utils",
         ":ir_emitter",
@@ -220,6 +222,7 @@ cc_library(
         "//xla/hlo/transforms/simplifiers:flatten_call_graph",
         "//xla/hlo/transforms/simplifiers:float_normalization",
         "//xla/hlo/transforms/simplifiers:gather_simplifier",
+        "//xla/hlo/transforms/simplifiers:gemv_rewriter",
         "//xla/hlo/transforms/simplifiers:hlo_computation_deduplicator",
         "//xla/hlo/transforms/simplifiers:hlo_constant_folding",
         "//xla/hlo/transforms/simplifiers:hlo_dce",
@@ -274,6 +277,7 @@ cc_library(
         "//xla/service:logical_buffer",
         "//xla/service:map_inliner",
         "//xla/service:multi_module_driver",
+        "//xla/service:scan_expander",
         "//xla/service:scatter_expander",
         "//xla/service:scatter_simplifier",
         "//xla/service:select_and_scatter_expander",
@@ -287,6 +291,7 @@ cc_library(
         "//xla/service:while_loop_constant_sinking",
         "//xla/service:while_loop_invariant_code_motion",
         "//xla/service:while_loop_simplifier",
+        "//xla/service:xla_transform",
         "//xla/service/llvm_ir:llvm_command_line_options",
         "//xla/service/llvm_ir:llvm_util",
         "//xla/service/spmd:stateful_rng_spmd_partitioner",
@@ -423,6 +428,17 @@ cc_library(
 )
 
 cc_library(
+    name = "export_hlo",
+    hdrs = ["export_hlo.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        ":executable_proto_cc",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     # The old target name will still be used so that dependencies won't break.
     # In the future, dependencies should be cleaned up and relinked to the above
     # target if registration is not necessary.
@@ -456,7 +472,9 @@ cc_library(
         "@llvm-project//llvm:Support",
         "@llvm-project//llvm:Target",
         "@llvm-project//llvm:TargetParser",
-    ],
+    ] + if_include_google_deps(
+        xla_internal(["//xla/service/cpu/google:export_hlo"]),
+    ),
     alwayslink = True,  # Contains compiler registration
 )
 
@@ -818,6 +836,7 @@ cc_library(
         "//xla/backends/cpu/runtime:logical_id_thunk",
         "//xla/backends/cpu/runtime:outfeed_thunk",
         "//xla/backends/cpu/runtime:reduce_scatter_thunk",
+        "//xla/backends/cpu/runtime:rng_seed_thunk",
         "//xla/backends/cpu/runtime:rng_state_thunk",
         "//xla/backends/cpu/runtime:sort_thunk",
         "//xla/backends/cpu/runtime:thunk",
@@ -826,6 +845,7 @@ cc_library(
         "//xla/backends/cpu/runtime/onednn:onednn_fusion_thunk",
         "//xla/backends/cpu/runtime/ynnpack:ynn_fusion_thunk",
         "//xla/backends/cpu/runtime/ynnpack:ynn_interop",
+        "//xla/backends/cpu/transforms:library_fusion_kinds",
         "//xla/codegen:kernel_definition",
         "//xla/codegen:kernel_spec",
         "//xla/codegen:llvm_kernel_source",
@@ -1816,6 +1836,7 @@ cc_library(
         "//xla/backends/cpu/codegen:object_loader",
         "//xla/backends/cpu/runtime:function_library",
         "//xla/hlo/ir:hlo",
+        "//xla/service:compiled_module",
         "//xla/service:compiler",
         "//xla/service:executable",
         "//xla/service:hlo_module_config",

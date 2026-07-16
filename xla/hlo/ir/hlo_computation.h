@@ -405,7 +405,7 @@ class HloComputation {
 
   // Serializes this computation to a proto.
   void ToProto(HloComputationProto* proto,
-               HloPayloadDeduplicator* deduplicator = nullptr) const;
+               HloProtoOptions options = HloProtoOptions()) const;
 
   // Creates a computation from the given proto. Arguments:
   //
@@ -640,7 +640,10 @@ class HloComputation {
   // instruction from computation. Updates uses and root instruction.
   absl::Status ReplaceWithNewInstruction(
       HloInstruction* old_instruction,
-      std::unique_ptr<HloInstruction> new_instruction);
+      std::unique_ptr<HloInstruction> new_instruction,
+      bool preserve_sharding = false, bool relay_control_dependency = false,
+      bool remove_unused_operands = true,
+      bool preserve_frontend_attributes = true);
 
   // Replaces an old instruction with a newly created instruction, and adds the
   // new instruction as an entry computation's parameter. Removes old
